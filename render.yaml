@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: mosach-sagol-bot
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: PORT
+        value: 3000
