@@ -13,94 +13,114 @@ const C = {
   PORT:          process.env.PORT || 3000,
 };
 
-const SYSTEM = `אתה הבוט הרשמי של מוסך סגול — מוסך מורשה בניהול חן בר.
-כתובת: רבניצקי 5, פתח תקווה
-שעות: א׳–ה׳ 08:00–18:00 | ו׳ 08:00–13:00
-אתר לקביעת תור: https://se-gol.net
-WhatsApp: 054-3393338
-שירותים: טיפול שוטף, טסט, בלמים, מיזוג, גלגלים, חשמל, דיאגנוסטיקה.
-ענה תמיד בעברית, קצר (עד 4 שורות). אל תתחייב למחיר. בשיחה ראשונה סיים עם: לקביעת תור: https://se-gol.net`;
+const SYSTEM = `אתה נציג שירות מקצועי של מוסך סגול — מוסך מורשה משרד התחבורה, בניהולו של חן בר, רבניצקי 5 פתח תקווה.
+המוסך פועל למעלה מ-20 שנה ומתמחה במכונאות כללית, דיאגנוסטיקה, חשמל רכב, מיזוג אוויר, בלמים, גלגלים, וטיפולים שוטפים.
+שעות פעילות: ימים א׳–ה׳ 08:00–18:00 | יום ו׳ 08:00–13:00
+לקביעת תור: https://se-gol.net | טלפון: 054-3393338
 
-// זיכרון שיחות
+כללי תגובה — חובה לפעול לפיהם:
+
+1. שפה: עברית תקנית ונקייה בלבד. ללא ביטויים מדוברים, ללא שגיאות כתיב, ללא חזרות מיותרות.
+2. אורך: עד 3 שורות קצרות. תמציתי, ישיר, ברור.
+3. טון: מקצועי, אמין, חם — כפי שמדבר בעל מקצוע ותיק עם לקוח.
+4. מחיר: לעולם אל תציין מחיר. אמור בדיוק: "חן ישמח לתת הצעת מחיר לאחר בדיקה קצרה."
+5. תור: כשלקוח מעוניין בתור, בקש שם, סוג רכב ושנה, וסוג השירות הנדרש.
+6. סיום: בסיום שיחה ראשונה בלבד — הוסף: "לקביעת תור: https://se-gol.net"
+7. אסור: אל תשתמש במילים "תחזוקה", "בוודאי", "כמובן", "נהדר", "מצוין" — הן נשמעות לא אותנטיות.
+8. אסור: אל תפתח תגובה במילה "שלום" בכל הודעה — רק בהודעה הראשונה.`;
+
 const conversations = new Map();
+
 function getHistory(phone) {
   if (!conversations.has(phone)) conversations.set(phone, []);
   return conversations.get(phone);
 }
+
 function addMsg(phone, role, content) {
   const h = getHistory(phone);
   h.push({ role, content });
-  if (h.length > 10) h.splice(0, h.length - 10);
+  if (h.length > 12) h.splice(0, h.length - 12);
 }
 
-// שליחה ל-WhatsApp
+function isFirstMessage(phone) {
+  return getHistory(phone).length === 0;
+}
+
 async function send(to, body) {
   try {
-    const r = await axios.post(
+    await axios.post(
       `https://api.ultramsg.com/${C.WA_INSTANCE}/messages/chat`,
       { token: C.WA_TOKEN, to, body },
       { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
     );
-    console.log(`✅ נשלח ל-${to}`);
-    return r.data;
+    console.log(`✅ נשלח ל-${to}: ${body.slice(0, 70)}`);
   } catch (e) {
     console.error('❌ UltraMsg:', e.message);
   }
 }
 
-// Claude AI
 async function reply(phone, msg) {
+  const first = isFirstMessage(phone);
   addMsg(phone, 'user', msg);
+
   try {
     const r = await axios.post(
       'https://api.anthropic.com/v1/messages',
-      { model: 'claude-haiku-4-5-20251001', max_tokens: 400, system: SYSTEM, messages: getHistory(phone) },
-      { headers: { 'x-api-key': C.ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' }, timeout: 15000 }
+      {
+        model:      'claude-haiku-4-5-20251001',
+        max_tokens: 350,
+        system:     SYSTEM,
+        messages:   getHistory(phone),
+      },
+      {
+        headers: {
+          'x-api-key':        C.ANTHROPIC_KEY,
+          'anthropic-version':'2023-06-01',
+          'Content-Type':     'application/json',
+        },
+        timeout: 15000,
+      }
     );
-    const text = r.data.content?.[0]?.text || 'שגיאה זמנית — נסה שוב';
+
+    let text = r.data.content?.[0]?.text || '';
+
+    // ניקוי אוטומטי — הסרת מילים אסורות
+    text = text
+      .replace(/\bבוודאי\b/g, 'כן')
+      .replace(/\bכמובן\b/g, '')
+      .replace(/\bנהדר\b/g, '')
+      .replace(/\bמצוין\b/g, '')
+      .replace(/\bתחזוקה\b/g, 'טיפול')
+      .replace(/  +/g, ' ')
+      .trim();
+
     addMsg(phone, 'assistant', text);
     return text;
+
   } catch (e) {
     console.error('❌ Claude:', e.response?.data?.error?.message || e.message);
-    return `שלום! מוסך סגול 🔧\nחן זמין ב-054-3393338\n${C.website}`;
+    return 'שלום, מוסך סגול לשירותך.\nלתיאום ישיר ניתן להתקשר: 054-3393338';
   }
 }
 
-// ─── WEBHOOK — מקבל הכל מ-UltraMsg ─────────────────────────────
+// ─── WEBHOOK ─────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
-  res.status(200).send('OK'); // מיידי תמיד
+  res.status(200).send('OK');
 
-  // לוג של כל מה שמגיע — לאבחון
-  console.log('📨 WEBHOOK RAW:', JSON.stringify(req.body).slice(0, 300));
+  console.log('📨 נכנס:', JSON.stringify(req.body).slice(0, 300));
 
   try {
-    // UltraMsg שולח בפורמטים שונים — מנסים את כולם
     const b    = req.body;
     const data = b?.data || b;
 
-    const from = data?.from || b?.from || '';
-    const msg  = data?.body || b?.body || data?.message || b?.message || '';
-    const name = data?.pushname || b?.pushname || data?.name || 'לקוח';
-    const type = (data?.type || b?.type || 'chat').toLowerCase();
+    const from = data?.from    || b?.from    || '';
+    const msg  = data?.body    || b?.body    || data?.message || b?.message || '';
+    const name = data?.pushname|| b?.pushname|| 'לקוח';
+    const type = (data?.type   || b?.type    || 'chat').toLowerCase();
 
-    if (!from || !msg) {
-      console.log('⏭️  מדלג — אין from/body');
-      return;
-    }
-
-    // לא לענות להודעות יוצאות שלנו
-    const cleanFrom = from.replace(/[^0-9]/g, '');
-    const cleanSelf = C.WA_NUMBER.replace(/[^0-9]/g, '');
-    if (cleanFrom === cleanSelf) {
-      console.log('⏭️  מדלג — הודעה מהבוט עצמו');
-      return;
-    }
-
-    // רק הודעות טקסט
-    if (!['chat', 'text', ''].includes(type)) {
-      console.log(`⏭️  מדלג — סוג: ${type}`);
-      return;
-    }
+    if (!from || !msg)                    return;
+    if (from.replace(/\D/g,'') === C.WA_NUMBER.replace(/\D/g,'')) return;
+    if (!['chat','text',''].includes(type)) return;
 
     console.log(`📩 [${name}] ${from}: "${msg}"`);
     const answer = await reply(from, msg);
@@ -111,24 +131,20 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ─── בדיקת שרת ──────────────────────────────────────────────────
-app.get('/',       (req, res) => res.json({ status: '✅ פעיל', bot: 'מוסך סגול', time: new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' }) }));
+app.get('/',       (req, res) => res.json({ status:'✅ פעיל', bot:'מוסך סגול', time: new Date().toLocaleString('he-IL',{timeZone:'Asia/Jerusalem'}) }));
 app.get('/health', (req, res) => res.send('OK'));
 
-// ─── KEEP-ALIVE — מונע שינה של השרת ─────────────────────────────
-// פינג עצמי כל 10 דקות כדי שהשרת לא ירדם
+// Keep-alive — מונע שינה ב-Free Plan
 setInterval(() => {
-  axios.get(`http://localhost:${C.PORT}/health`).catch(() => {});
+  axios.get(`http://localhost:${C.PORT}/health`).catch(()=>{});
 }, 10 * 60 * 1000);
 
-// ─── הפעלה ───────────────────────────────────────────────────────
 app.listen(C.PORT, () => {
   console.log('\n🔧 ===================================');
   console.log('   מוסך סגול — WhatsApp Bot');
   console.log('🔧 ===================================');
   console.log(`✅ פורט: ${C.PORT}`);
   console.log(`📱 Instance: ${C.WA_INSTANCE}`);
-  console.log(`🌐 Webhook: https://mosach-sagol-bot.onrender.com/webhook`);
   console.log(`🔑 API Key: ${C.ANTHROPIC_KEY ? '✅ מוגדר' : '❌ חסר!'}`);
   console.log('🔧 ===================================\n');
 });
