@@ -12,16 +12,17 @@ app.use(express.urlencoded({ extended: true }));
 
 // ── CONFIG (all secrets from env vars — never hardcode!) ────
 const C = {
-  WA_INSTANCE:   process.env.WA_INSTANCE   || 'instance167769',
-  WA_TOKEN:      process.env.WA_TOKEN      || '',
-  WA_NUMBER:     process.env.WA_NUMBER     || '972543393338',
-  ANTHROPIC_KEY: process.env.ANTHROPIC_API_KEY || '',
-  CHEN_PHONE:    process.env.CHEN_PHONE    || '972548800474',
-  MOSHIK_PHONE:  process.env.MOSHIK_PHONE  || '972544342000',
-  SUPABASE_URL:  process.env.SUPABASE_URL  || '',
-  SUPABASE_KEY:  process.env.SUPABASE_SERVICE_ROLE_KEY || '',
-  CLAUDE_MODEL:  process.env.CLAUDE_MODEL  || 'claude-haiku-4-5-20251001',
-  PORT:          process.env.PORT || 3000,
+  WA_INSTANCE:           process.env.WA_INSTANCE           || 'instance167769',
+  WA_TOKEN:              process.env.WA_TOKEN              || '',
+  WA_NUMBER:             process.env.WA_NUMBER             || '972543393338',
+  ANTHROPIC_KEY:         process.env.ANTHROPIC_API_KEY     || '',
+  CHEN_PHONE:            process.env.CHEN_PHONE            || '972548800474',
+  MOSHIK_PHONE:          process.env.MOSHIK_PHONE          || '972544342000',
+  SUPABASE_URL:          process.env.SUPABASE_URL          || '',
+  SUPABASE_KEY:          process.env.SUPABASE_SERVICE_ROLE_KEY || '',
+  CLAUDE_MODEL:          process.env.CLAUDE_MODEL          || 'claude-haiku-4-5-20251001',
+  MAKE_CALENDAR_WEBHOOK: process.env.MAKE_CALENDAR_WEBHOOK || '',
+  PORT:                  process.env.PORT || 3000,
 };
 
 // System prompt: full Aryeh personality from env var
@@ -163,6 +164,60 @@ function buildEscalationAlert(phone, resp) {
   ].filter(Boolean).join('\n');
 }
 
+// ── Calendar event placeholder time (tomorrow 09:00 Israel time) ─
+// Make/Google Calendar receives this as the tentative slot.
+// Chen sees the customer's actual requested time in the description
+// and adjusts the event after confirming.
+function computeTentativeSlot() {
+  const now    = new Date();
+  // Tomorrow in Asia/Jerusalem
+  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  // If tomorrow is Saturday → push to Sunday. If Friday → push to Sunday too (garage is closed Fri+Sat).
+  const dow = tomorrow.getDay(); // 0=Sun, 5=Fri, 6=Sat
+  let daysToAdd = 0;
+  if (dow === 5) daysToAdd = 2;   // Fri → Sun
+  if (dow === 6) daysToAdd = 1;   // Sat → Sun
+  const target = new Date(tomorrow.getTime() + daysToAdd * 24 * 60 * 60 * 1000);
+  // Set to 09:00 Israel local time. Israel is UTC+2 (winter) or UTC+3 (summer).
+  // Simplest: build ISO string in Israel timezone explicitly.
+  const yyyy = target.getFullYear();
+  const mm   = String(target.getMonth() + 1).padStart(2, '0');
+  const dd   = String(target.getDate()).padStart(2, '0');
+  // Use +03:00 (IDT — Israeli summer time) as default. Calendar normalizes anyway.
+  const start = `${yyyy}-${mm}-${dd}T09:00:00+03:00`;
+  const end   = `${yyyy}-${mm}-${dd}T10:30:00+03:00`;
+  return { start, end };
+}
+
+// ── Send appointment to Google Calendar via Make webhook ────
+async function pushToCalendar(phone, ld, resp) {
+  if (!C.MAKE_CALENDAR_WEBHOOK) return;
+
+  const { start, end } = computeTentativeSlot();
+
+  const payload = {
+    name:                 ld.name || '',
+    phone:                fmtPhone(phone),
+    car:                  [ld.car_make, ld.car_model, ld.car_year].filter(Boolean).join(' ') || '',
+    km:                   ld.km || '',
+    service:              ld.service_requested || '',
+    preferred_date_text:  ld.preferred_date || '',
+    start_iso:            start,
+    end_iso:              end,
+    internal_note:        resp.internal_note || ''
+  };
+
+  try {
+    await axios.post(C.MAKE_CALENDAR_WEBHOOK, payload, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+    console.log(`📅 Calendar event sent for ${ld.name}`);
+  } catch (e) {
+    console.error('❌ Calendar webhook:', e.response?.data || e.message);
+  }
+}
+
 // ── Save to Supabase (fire-and-forget, optional) ─────────────
 async function saveToSupabase(table, body) {
   if (!C.SUPABASE_URL || !C.SUPABASE_KEY) return;
@@ -213,7 +268,7 @@ async function reply(phone, profileName, userMessage) {
     conv.notified.newLead = true;
   }
 
-  // ── Appointment booking → notify Chen + Moshik ───────────
+  // ── Appointment booking → notify Chen + Moshik + Google Calendar ──
   if (
     resp.intent === 'book_appointment' &&
     typeof ld.name === 'string' && ld.name.length > 1 &&
@@ -223,6 +278,7 @@ async function reply(phone, profileName, userMessage) {
     const body = buildAppointmentAlert(phone, ld);
     await send(C.CHEN_PHONE, body);
     await send(C.MOSHIK_PHONE, body);
+    await pushToCalendar(phone, ld, resp);
     conv.notified.appointment = true;
   }
 
@@ -303,5 +359,6 @@ app.listen(C.PORT, () => {
   console.log(`📝 System Prompt:  ${SYSTEM_PROMPT.length} chars`);
   console.log(`🤖 Model:          ${C.CLAUDE_MODEL}`);
   console.log(`📊 Supabase:       ${C.SUPABASE_URL ? '✅' : '⚠️  not set'}`);
+  console.log(`📅 Calendar Hook:  ${C.MAKE_CALENDAR_WEBHOOK ? '✅' : '⚠️  not set'}`);
   console.log('🔧 ===================================\n');
 });
