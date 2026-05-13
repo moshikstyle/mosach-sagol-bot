@@ -36,6 +36,76 @@ const conversations = new Map();
 // Auto-cleared after 4 hours
 const pendingApprovals = new Map();
 
+// ── Service duration map (minutes) ─────────────────────────
+// Used to compute calendar event end time.
+const SERVICE_DURATIONS = {
+  'annual_service':  90,
+  'oil_change':      30,
+  'test_transfer':   90,
+  'brake_check':     60,
+  'general_check':   60,
+  'alignment':       45,
+  'ac_service':      60,
+  'diagnostic':      90,
+  'electrical':      60,
+  'transmission':   120,
+  'suspension':      90,
+  'default':         60
+};
+
+// ── Daily appointment cap ──────────────────────────────────
+const MAX_PER_DAY = 8;
+const STANDARD_SLOTS = ['09:00', '10:30', '12:00', '13:30', '15:00'];
+const HEBREW_DAY_NAMES = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
+
+// Daily booking counter: 'YYYY-MM-DD' → count
+const dailyBookings = new Map();
+
+function ymd(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Generate 5-8 specific available slots for the next ~10 working days
+function computeAvailableSlots(limit = 6) {
+  const slots = [];
+  const now   = new Date();
+  for (let i = 1; i <= 14 && slots.length < limit; i++) {
+    const d   = new Date(now.getTime() + i * 24 * 60 * 60 * 1000);
+    const dow = d.getDay(); // 0=Sun, 5=Fri, 6=Sat
+    if (dow === 5 || dow === 6) continue; // garage closed
+    const key   = ymd(d);
+    const count = dailyBookings.get(key) || 0;
+    if (count >= MAX_PER_DAY) continue;
+
+    // Pick 2 representative slot times for this day (morning + afternoon)
+    const picks = [STANDARD_SLOTS[0], STANDARD_SLOTS[3]]; // 09:00 + 13:30
+    for (const time of picks) {
+      if (slots.length >= limit) break;
+      slots.push({
+        date:     key,
+        time,
+        dayName:  HEBREW_DAY_NAMES[dow],
+        display:  `יום ${HEBREW_DAY_NAMES[dow]} (${d.getDate()}/${d.getMonth() + 1}) ${time}`
+      });
+    }
+  }
+  return slots;
+}
+
+function formatSlotsForPrompt() {
+  const slots = computeAvailableSlots(6);
+  if (slots.length === 0) {
+    return 'כל הסלוטים תפוסים השבוע. תכוון את הלקוח לחזור אלינו בשבוע הבא.';
+  }
+  return slots.map(s => `• ${s.display}`).join('\n');
+}
+
+// ── Urgent request detection ───────────────────────────────
+const URGENT_REGEX = /דחוף|דחיפ|מיידי|לא מתניע|תקוע בכביש|תאונה|אסון|מצב חירום|בוער|הרגע עכשיו|בהול/i;
+function isUrgentRequest(msg) {
+  return typeof msg === 'string' && URGENT_REGEX.test(msg);
+}
+
 function genApprovalCode() {
   // 4-char alphanumeric, easy to type
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -80,6 +150,45 @@ async function send(to, body) {
   }
 }
 
+// ── Send an interactive button message via UltraMsg ─────────
+// Falls back to plain text if buttons endpoint fails.
+async function sendButtons(to, body, buttons, header, footer) {
+  // UltraMsg accepts up to 3 buttons. Buttons are sent as comma-separated string.
+  const buttonsList = (buttons || []).slice(0, 3);
+  if (buttonsList.length === 0) return send(to, body);
+
+  try {
+    const payload = {
+      token:   C.WA_TOKEN,
+      to,
+      body,
+      footer:  footer || '',
+      buttons: buttonsList.join(','),
+    };
+    if (header) payload.header = header;
+
+    const resp = await axios.post(
+      `https://api.ultramsg.com/${C.WA_INSTANCE}/messages/buttons`,
+      payload,
+      { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
+    );
+    if (resp.data?.sent === 'true' || resp.data?.sent === true) {
+      console.log(`🔘 buttons → ${to}: [${buttonsList.join(' | ')}]`);
+      return true;
+    }
+    // Unsupported or error → fall back
+    console.warn('Buttons endpoint returned:', resp.data, '— falling back to text');
+    const fallback = `${body}\n\n${buttonsList.map(b => `▸ ${b}`).join('\n')}\n\n(השב עם הטקסט של הכפתור הרצוי)`;
+    await send(to, fallback);
+    return false;
+  } catch (e) {
+    console.error('❌ UltraMsg buttons:', e.response?.data || e.message, '— falling back to text');
+    const fallback = `${body}\n\n${buttonsList.map(b => `▸ ${b}`).join('\n')}\n\n(השב עם הטקסט של הכפתור הרצוי)`;
+    await send(to, fallback);
+    return false;
+  }
+}
+
 // ── Call Claude with JSON prefill (forces structured output) ─
 async function callClaude(history, userMessage) {
   const msgs = [
@@ -88,13 +197,20 @@ async function callClaude(history, userMessage) {
     { role: 'assistant', content: '{' }
   ];
 
+  // Build enriched system prompt with live availability slots
+  const liveSlots = formatSlotsForPrompt();
+  const enrichedSystem = SYSTEM_PROMPT
+    + '\n\n## סלוטים פנויים כרגע ביומן של המוסך — להציע רק מהרשימה הזאת!\n'
+    + liveSlots
+    + '\n\n**אסור** להציע זמן שלא מופיע ברשימה למעלה. אם הלקוח רוצה זמן אחר — הצע לו לבחור מהרשימה הקיימת.';
+
   try {
     const r = await axios.post(
       'https://api.anthropic.com/v1/messages',
       {
         model:          C.CLAUDE_MODEL,
         max_tokens:     1024,
-        system:         SYSTEM_PROMPT,
+        system:         enrichedSystem,
         messages:       msgs,
         stop_sequences: ['\n}\n']
       },
@@ -151,7 +267,9 @@ function buildLeadAlert(phone, ld, resp) {
   ].filter(Boolean).join('\n');
 }
 
-function buildAppointmentAlert(phone, ld, code) {
+// Builds just the body text for the appointment alert (no button instructions —
+// those are sent as actual buttons separately)
+function buildAppointmentAlertBody(phone, ld, code) {
   const car = [ld.car_make, ld.car_model, ld.car_year].filter(Boolean).join(' ');
   return [
     '📅 *בקשת תור חדשה — אריה*',
@@ -160,16 +278,19 @@ function buildAppointmentAlert(phone, ld, code) {
     `📱 ${fmtPhone(phone)}`,
     car                  && `🚗 ${car}`,
     ld.service_requested && `🔧 ${ld.service_requested}`,
-    ld.preferred_date    && `🗓️ זמן מבוקש: ${ld.preferred_date}`,
+    ld.preferred_date    && `🗓️ זמן: ${ld.preferred_date}`,
     '',
-    '━━━━━━━━━━━━━━━━━━━',
-    `*קוד אישור: ${code}*`,
-    '',
-    `✅ לאישור — השב: *אישור ${code}*`,
-    `❌ לדחיה — השב: *דחה ${code}*`,
-    '',
-    'לאחר אישור — הלקוח יקבל אוטומטית הודעת אישור מאריה.'
+    `קוד: ${code}`
   ].filter(Boolean).join('\n');
+}
+
+// Buttons that appear under the alert (max 3, max 20 chars each)
+function buildAppointmentAlertButtons(code) {
+  return [
+    `אישור ${code}`,
+    `דחה ${code}`,
+    `פרטים ${code}`
+  ];
 }
 
 function buildWeekendBlockAlert(phone, ld) {
@@ -200,32 +321,38 @@ function buildEscalationAlert(phone, resp) {
 // Make/Google Calendar receives this as the tentative slot.
 // Chen sees the customer's actual requested time in the description
 // and adjusts the event after confirming.
-function computeTentativeSlot() {
-  const now    = new Date();
-  // Tomorrow in Asia/Jerusalem
+function computeTentativeSlot(serviceKey) {
+  const now      = new Date();
   const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-  // If tomorrow is Saturday → push to Sunday. If Friday → push to Sunday too (garage is closed Fri+Sat).
-  const dow = tomorrow.getDay(); // 0=Sun, 5=Fri, 6=Sat
-  let daysToAdd = 0;
+  const dow      = tomorrow.getDay();
+  let daysToAdd  = 0;
   if (dow === 5) daysToAdd = 2;   // Fri → Sun
   if (dow === 6) daysToAdd = 1;   // Sat → Sun
-  const target = new Date(tomorrow.getTime() + daysToAdd * 24 * 60 * 60 * 1000);
-  // Set to 09:00 Israel local time. Israel is UTC+2 (winter) or UTC+3 (summer).
-  // Simplest: build ISO string in Israel timezone explicitly.
-  const yyyy = target.getFullYear();
-  const mm   = String(target.getMonth() + 1).padStart(2, '0');
-  const dd   = String(target.getDate()).padStart(2, '0');
-  // Use +03:00 (IDT — Israeli summer time) as default. Calendar normalizes anyway.
-  const start = `${yyyy}-${mm}-${dd}T09:00:00+03:00`;
-  const end   = `${yyyy}-${mm}-${dd}T10:30:00+03:00`;
-  return { start, end };
+  const target   = new Date(tomorrow.getTime() + daysToAdd * 24 * 60 * 60 * 1000);
+  const yyyy     = target.getFullYear();
+  const mm       = String(target.getMonth() + 1).padStart(2, '0');
+  const dd       = String(target.getDate()).padStart(2, '0');
+
+  // Duration from service map
+  const minutes = SERVICE_DURATIONS[serviceKey] || SERVICE_DURATIONS.default;
+  const startHr = 9, startMin = 0;
+  const endMinutesTotal = startHr * 60 + startMin + minutes;
+  const endHr  = Math.floor(endMinutesTotal / 60);
+  const endMin = endMinutesTotal % 60;
+
+  const start = `${yyyy}-${mm}-${dd}T${String(startHr).padStart(2, '0')}:${String(startMin).padStart(2, '0')}:00+03:00`;
+  const end   = `${yyyy}-${mm}-${dd}T${String(endHr).padStart(2, '0')}:${String(endMin).padStart(2, '0')}:00+03:00`;
+
+  return { start, end, dateKey: `${yyyy}-${mm}-${dd}` };
 }
 
 // ── Send appointment to Google Calendar via Make webhook ────
 async function pushToCalendar(phone, ld, resp) {
   if (!C.MAKE_CALENDAR_WEBHOOK) return;
 
-  const { start, end } = computeTentativeSlot();
+  const { start, end, dateKey } = computeTentativeSlot(ld.service_requested);
+  // Track daily count
+  dailyBookings.set(dateKey, (dailyBookings.get(dateKey) || 0) + 1);
 
   const payload = {
     name:                 ld.name || '',
@@ -324,9 +451,11 @@ async function reply(phone, profileName, userMessage) {
       // Auto-cleanup after 4 hours
       setTimeout(() => pendingApprovals.delete(code), 4 * 60 * 60 * 1000);
 
-      const body = buildAppointmentAlert(phone, ld, code);
-      await send(C.CHEN_PHONE, body);
-      await send(C.MOSHIK_PHONE, body);
+      const body    = buildAppointmentAlertBody(phone, ld, code);
+      const buttons = buildAppointmentAlertButtons(code);
+      const footer  = 'בחר אפשרות:';
+      await sendButtons(C.CHEN_PHONE,   body, buttons, null, footer);
+      await sendButtons(C.MOSHIK_PHONE, body, buttons, null, footer);
       await pushToCalendar(phone, ld, resp);
       conv.notified.appointment = true;
     }
@@ -363,7 +492,36 @@ async function tryOperatorCommand(from, msg) {
   const isOperator = cleanFrom === C.CHEN_PHONE || cleanFrom === C.MOSHIK_PHONE;
   if (!isOperator) return false;
 
-  const trimmed = msg.trim();
+  // Normalize: strip emoji/decorative chars + collapse whitespace
+  const trimmed = msg.trim().replace(/^[\s✅✓❌✗🔘📋🟢🔴⚪️▸•]+/u, '').trim();
+
+  // "פרטים CODE" — return full lead details to the operator
+  const detailsMatch = trimmed.match(/^(פרטים|details|info)[\s:]+([A-Z0-9]{3,6})/i);
+  if (detailsMatch) {
+    const code    = detailsMatch[2].toUpperCase();
+    const pending = pendingApprovals.get(code);
+    if (!pending) {
+      await send(from, `⚠️ קוד ${code} לא נמצא או פג תוקף.`);
+      return true;
+    }
+    const car = [pending.ld.car_make, pending.ld.car_model, pending.ld.car_year].filter(Boolean).join(' ');
+    const details = [
+      `📋 *פרטי ליד ${code}*`,
+      '',
+      `👤 ${pending.name}`,
+      `📱 ${fmtPhone(pending.phone)}`,
+      car                            && `🚗 ${car}`,
+      pending.ld.km                  && `📊 ${pending.ld.km} ק"מ`,
+      pending.ld.service_requested   && `🔧 ${pending.ld.service_requested}`,
+      pending.ld.preferred_date      && `🗓️ זמן: ${pending.ld.preferred_date}`,
+      pending.ld.area                && `📍 ${pending.ld.area}`,
+      '',
+      `לאישור: השב *אישור ${code}*`,
+      `לדחיה: השב *דחה ${code}*`
+    ].filter(Boolean).join('\n');
+    await send(from, details);
+    return true;
+  }
 
   // Approval pattern: "אישור CODE" / "אשר CODE" / "מאשר CODE" / "approve CODE" / "ok CODE"
   const approveMatch = trimmed.match(/^(אישור|אשר|מאשר|approve|ok)[\s:]+([A-Z0-9]{3,6})/i);
@@ -450,13 +608,41 @@ app.post('/webhook', async (req, res) => {
 
     if (!from || !msg) return;
     if (from.replace(/\D/g, '') === C.WA_NUMBER.replace(/\D/g, '')) return;
-    if (!['chat', 'text', ''].includes(type)) return;
+    // Accept text and button-reply types (UltraMsg may use 'buttons_reply' or similar)
+    if (!['chat', 'text', 'buttons_reply', 'interactive', 'list_reply', ''].includes(type)) return;
 
     console.log(`📩 [${name}] ${from}: "${msg}"`);
 
     // Check if this is an operator command (Chen / Moshik approving/rejecting)
     const handled = await tryOperatorCommand(from, msg);
     if (handled) return;
+
+    // ── URGENT detection — bypass normal flow, give Chen's phone directly ──
+    if (isUrgentRequest(msg)) {
+      console.log(`🚨 URGENT request from ${from}: "${msg.slice(0, 80)}"`);
+      const urgentReply = [
+        'מבין שזה דחוף 🚨',
+        '',
+        'התקשר ישירות לחן עכשיו:',
+        '*054-8800474*',
+        '',
+        'הוא יענה לך אישית. אם לא ענה תוך 5 דקות — תתקשר למושיק: *054-4342000*'
+      ].join('\n');
+      await send(from, urgentReply);
+
+      // Notify Chen so he expects a call
+      const chenAlert = [
+        '🚨 *פניה דחופה — צפויה לך שיחה!*',
+        '',
+        `📱 לקוח: ${fmtPhone(from)}`,
+        `📝 הודעה: "${msg.slice(0, 200)}"`,
+        '',
+        'אריה הפנה אותו אליך ישירות לטלפון.'
+      ].join('\n');
+      await send(C.CHEN_PHONE, chenAlert);
+      await send(C.MOSHIK_PHONE, chenAlert);
+      return;
+    }
 
     const answer = await reply(from, name, msg);
     if (answer) await send(from, answer);
