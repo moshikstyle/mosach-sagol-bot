@@ -410,6 +410,23 @@ async function reply(phone, profileName, userMessage) {
 
   let outText = (resp.message || '').trim();
 
+  // ── Slot offering: append clickable wa.me links per slot ────
+  // Triggered when Aryeh returns intent="offer_slots" with offered_slots[]
+  const offeredSlots = resp.lead_data?.offered_slots;
+  if (resp.intent === 'offer_slots' && Array.isArray(offeredSlots) && offeredSlots.length) {
+    const links = offeredSlots
+      .filter(s => typeof s === 'string' && s.trim())
+      .slice(0, 8)
+      .map(slot => {
+        const url = `https://wa.me/${C.WA_NUMBER}?text=${encodeURIComponent('בחר ' + slot)}`;
+        return `🕐 *${slot}*\n${url}`;
+      })
+      .join('\n\n');
+    if (links) {
+      outText += `\n\n${links}\n\n_לחיצה תפתח וואטסאפ עם הבחירה מוכנה — רק תלחץ ״שלח״._`;
+    }
+  }
+
   // UltraMsg has no interactive buttons → render as text hints
   if (Array.isArray(resp.buttons) && resp.buttons.length > 0) {
     const lines = resp.buttons
