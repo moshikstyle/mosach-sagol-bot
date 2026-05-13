@@ -267,10 +267,13 @@ function buildLeadAlert(phone, ld, resp) {
   ].filter(Boolean).join('\n');
 }
 
-// Builds just the body text for the appointment alert (no button instructions —
-// those are sent as actual buttons separately)
-function buildAppointmentAlertBody(phone, ld, code) {
-  const car = [ld.car_make, ld.car_model, ld.car_year].filter(Boolean).join(' ');
+// Builds the full appointment alert with clickable wa.me deeplinks.
+// Tapping a link opens WhatsApp with the approval/rejection text pre-filled —
+// the operator just hits Send.
+function buildAppointmentAlertWithLinks(phone, ld, code) {
+  const car         = [ld.car_make, ld.car_model, ld.car_year].filter(Boolean).join(' ');
+  const approveLink = `https://wa.me/${C.WA_NUMBER}?text=${encodeURIComponent('אישור ' + code)}`;
+  const rejectLink  = `https://wa.me/${C.WA_NUMBER}?text=${encodeURIComponent('דחה '   + code)}`;
   return [
     '📅 *בקשת תור חדשה — אריה*',
     '',
@@ -278,19 +281,19 @@ function buildAppointmentAlertBody(phone, ld, code) {
     `📱 ${fmtPhone(phone)}`,
     car                  && `🚗 ${car}`,
     ld.service_requested && `🔧 ${ld.service_requested}`,
-    ld.preferred_date    && `🗓️ זמן: ${ld.preferred_date}`,
+    ld.preferred_date    && `🗓️ זמן מבוקש: ${ld.preferred_date}`,
     '',
-    `קוד: ${code}`
+    '━━━━━━━━━━━━━━━━━━━',
+    `קוד: *${code}*`,
+    '',
+    '✅ *לאישור — לחץ כאן:*',
+    approveLink,
+    '',
+    '❌ *לדחיה — לחץ כאן:*',
+    rejectLink,
+    '',
+    '_לחיצה תפתח וואטסאפ עם הודעה מוכנה — רק תלחץ ״שלח״ ואריה יסיים אוטומטית._'
   ].filter(Boolean).join('\n');
-}
-
-// Buttons that appear under the alert (max 3, max 20 chars each)
-function buildAppointmentAlertButtons(code) {
-  return [
-    `אישור ${code}`,
-    `דחה ${code}`,
-    `פרטים ${code}`
-  ];
 }
 
 function buildWeekendBlockAlert(phone, ld) {
@@ -451,11 +454,9 @@ async function reply(phone, profileName, userMessage) {
       // Auto-cleanup after 4 hours
       setTimeout(() => pendingApprovals.delete(code), 4 * 60 * 60 * 1000);
 
-      const body    = buildAppointmentAlertBody(phone, ld, code);
-      const buttons = buildAppointmentAlertButtons(code);
-      const footer  = 'בחר אפשרות:';
-      await sendButtons(C.CHEN_PHONE,   body, buttons, null, footer);
-      await sendButtons(C.MOSHIK_PHONE, body, buttons, null, footer);
+      const alertBody = buildAppointmentAlertWithLinks(phone, ld, code);
+      await send(C.CHEN_PHONE,   alertBody);
+      await send(C.MOSHIK_PHONE, alertBody);
       await pushToCalendar(phone, ld, resp);
       conv.notified.appointment = true;
     }
