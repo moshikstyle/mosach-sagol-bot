@@ -245,21 +245,45 @@ async function callClaude(history, userMessage) {
 // ── Format Israeli phone ─────────────────────────────────────
 function fmtPhone(p) {
   if (!p) return '';
-  if (p.startsWith('972')) return '0' + p.slice(3, 5) + '-' + p.slice(5, 8) + '-' + p.slice(8);
-  return p;
+  // Strip WhatsApp internal suffix (@c.us / @g.us) and any non-digits
+  const clean = String(p).replace(/@c\.us$|@g\.us$/, '').replace(/\D/g, '');
+  if (clean.startsWith('972') && clean.length === 12) {
+    return '0' + clean.slice(3, 5) + '-' + clean.slice(5, 8) + '-' + clean.slice(8);
+  }
+  return clean || p;
+}
+
+// Hebrew display name for internal service codes
+const SERVICE_HEBREW = {
+  annual_service:   'טיפול שנתי',
+  oil_change:       'החלפת שמן וסינון',
+  test_transfer:    'העברת טסט',
+  brake_check:      'בדיקת בלמים',
+  general_check:    'בדיקה כללית',
+  alignment:        'איזון וכיוון גלגלים',
+  ac_service:       'שירות מזגן',
+  diagnostic:       'אבחון תקלה',
+  electrical:       'חשמלאות',
+  transmission:     'גיר אוטומטי',
+  suspension:       'מתלים ובולמים',
+  general_service:  'טיפול כללי'
+};
+function serviceHe(code) {
+  if (!code) return '';
+  return SERVICE_HEBREW[code] || code;
 }
 
 // ── Build alert messages ─────────────────────────────────────
 function buildLeadAlert(phone, ld, resp) {
   const car = [ld.car_make, ld.car_model, ld.car_year].filter(Boolean).join(' ');
   return [
-    '🚨 ליד חדש מאריה',
+    '🚨 *ליד חדש מאריה*',
     '',
     `📱 ${fmtPhone(phone)}`,
     ld.name              && `👤 ${ld.name}`,
     car                  && `🚗 ${car}`,
     ld.km                && `📊 ${ld.km} ק"מ`,
-    ld.service_requested && `🔧 ${ld.service_requested}`,
+    ld.service_requested && `🔧 ${serviceHe(ld.service_requested)}`,
     ld.preferred_date    && `📅 ${ld.preferred_date}`,
     ld.area              && `📍 ${ld.area}`,
     `🌡️ ציון חום: ${resp.lead_score || 0}/10`,
@@ -280,7 +304,7 @@ function buildAppointmentAlertWithLinks(phone, ld, code) {
     `👤 ${ld.name}`,
     `📱 ${fmtPhone(phone)}`,
     car                  && `🚗 ${car}`,
-    ld.service_requested && `🔧 ${ld.service_requested}`,
+    ld.service_requested && `🔧 ${serviceHe(ld.service_requested)}`,
     ld.preferred_date    && `🗓️ זמן מבוקש: ${ld.preferred_date}`,
     '',
     '━━━━━━━━━━━━━━━━━━━',
@@ -411,8 +435,9 @@ async function reply(phone, profileName, userMessage) {
   let outText = (resp.message || '').trim();
 
   // ── Slot offering: append clickable wa.me links per slot ────
-  // Triggered when Aryeh returns intent="offer_slots" with offered_slots[]
+  // Primary path: Aryeh tags intent="offer_slots" with offered_slots[]
   const offeredSlots = resp.lead_data?.offered_slots;
+  let slotsInjected = false;
   if (resp.intent === 'offer_slots' && Array.isArray(offeredSlots) && offeredSlots.length) {
     const links = offeredSlots
       .filter(s => typeof s === 'string' && s.trim())
@@ -424,6 +449,30 @@ async function reply(phone, profileName, userMessage) {
       .join('\n\n');
     if (links) {
       outText += `\n\n${links}\n\n_לחיצה תפתח וואטסאפ עם הבחירה מוכנה — רק תלחץ ״שלח״._`;
+      slotsInjected = true;
+    }
+  }
+
+  // ── Fallback: detect slot patterns in the body text and convert to clickable links ──
+  // Pattern matches: "יום ראשון (12/5) 09:00" — Hebrew day + date + time
+  if (!slotsInjected) {
+    const slotRegex = /יום\s+(ראשון|שני|שלישי|רביעי|חמישי)\s*\(\d{1,2}\/\d{1,2}\)\s*\d{1,2}:\d{2}/g;
+    const matches = outText.match(slotRegex);
+    if (matches && matches.length >= 2) {
+      // Remove duplicates while preserving order
+      const uniqueSlots = [...new Set(matches)];
+      const linksBlock = uniqueSlots.slice(0, 8).map(slot => {
+        const url = `https://wa.me/${C.WA_NUMBER}?text=${encodeURIComponent('בחר ' + slot)}`;
+        return `🕐 *${slot}*\n${url}`;
+      }).join('\n\n');
+      // Strip the original slot lines from outText to avoid duplication
+      let cleaned = outText;
+      for (const slot of uniqueSlots) {
+        const lineRegex = new RegExp(`[•\\-\\*\\s]*${slot.replace(/[()/]/g, '\\$&')}\\s*\\n?`, 'g');
+        cleaned = cleaned.replace(lineRegex, '');
+      }
+      cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+      outText = `${cleaned}\n\n${linksBlock}\n\n_לחיצה תפתח וואטסאפ עם הבחירה מוכנה — רק תלחץ ״שלח״._`;
     }
   }
 
