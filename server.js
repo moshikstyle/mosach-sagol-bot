@@ -435,44 +435,55 @@ async function reply(phone, profileName, userMessage) {
   let outText = (resp.message || '').trim();
 
   // ── Slot offering: append clickable wa.me links per slot ────
-  // Primary path: Aryeh tags intent="offer_slots" with offered_slots[]
+  // Three layers of detection, in order of preference:
+  //   1. Aryeh tagged intent="offer_slots" + filled lead_data.offered_slots
+  //   2. Slot patterns visible in the message text (regex)
+  //   3. Aryeh's message implies slot offering — use server-computed slots
   const offeredSlots = resp.lead_data?.offered_slots;
-  let slotsInjected = false;
+  let slotsInjected  = false;
+
+  const injectSlots = (slotsArr) => {
+    const valid = (slotsArr || []).filter(s => typeof s === 'string' && s.trim()).slice(0, 8);
+    if (!valid.length) return false;
+    const links = valid.map(slot => {
+      const url = `https://wa.me/${C.WA_NUMBER}?text=${encodeURIComponent('בחר ' + slot)}`;
+      return `🕐 *${slot}*\n${url}`;
+    }).join('\n\n');
+    outText += `\n\n${links}\n\n_לחיצה תפתח וואטסאפ עם הבחירה מוכנה — רק תלחץ ״שלח״._`;
+    return true;
+  };
+
+  // Layer 1: explicit intent + structured slot list
   if (resp.intent === 'offer_slots' && Array.isArray(offeredSlots) && offeredSlots.length) {
-    const links = offeredSlots
-      .filter(s => typeof s === 'string' && s.trim())
-      .slice(0, 8)
-      .map(slot => {
-        const url = `https://wa.me/${C.WA_NUMBER}?text=${encodeURIComponent('בחר ' + slot)}`;
-        return `🕐 *${slot}*\n${url}`;
-      })
-      .join('\n\n');
-    if (links) {
-      outText += `\n\n${links}\n\n_לחיצה תפתח וואטסאפ עם הבחירה מוכנה — רק תלחץ ״שלח״._`;
-      slotsInjected = true;
-    }
+    slotsInjected = injectSlots(offeredSlots);
   }
 
-  // ── Fallback: detect slot patterns in the body text and convert to clickable links ──
-  // Pattern matches: "יום ראשון (12/5) 09:00" — Hebrew day + date + time
+  // Layer 2: regex-detect slot patterns already written in body
   if (!slotsInjected) {
     const slotRegex = /יום\s+(ראשון|שני|שלישי|רביעי|חמישי)\s*\(\d{1,2}\/\d{1,2}\)\s*\d{1,2}:\d{2}/g;
-    const matches = outText.match(slotRegex);
+    const matches   = outText.match(slotRegex);
     if (matches && matches.length >= 2) {
-      // Remove duplicates while preserving order
       const uniqueSlots = [...new Set(matches)];
-      const linksBlock = uniqueSlots.slice(0, 8).map(slot => {
-        const url = `https://wa.me/${C.WA_NUMBER}?text=${encodeURIComponent('בחר ' + slot)}`;
-        return `🕐 *${slot}*\n${url}`;
-      }).join('\n\n');
-      // Strip the original slot lines from outText to avoid duplication
+      // Strip the original slot lines to avoid duplication
       let cleaned = outText;
       for (const slot of uniqueSlots) {
         const lineRegex = new RegExp(`[•\\-\\*\\s]*${slot.replace(/[()/]/g, '\\$&')}\\s*\\n?`, 'g');
         cleaned = cleaned.replace(lineRegex, '');
       }
       cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
-      outText = `${cleaned}\n\n${linksBlock}\n\n_לחיצה תפתח וואטסאפ עם הבחירה מוכנה — רק תלחץ ״שלח״._`;
+      outText = cleaned;
+      slotsInjected = injectSlots(uniqueSlots);
+    }
+  }
+
+  // Layer 3: message implies slot offering but no list provided → use server's slots
+  if (!slotsInjected) {
+    const offerLikeText = /(הזמנים\s+(הפנויים|הקרובים|הזמינים))|(בחר\s+.*\s*(זמן|מועד|הגעה))|(הנה\s+.*(זמנים|מועדים|אפשרויות))/i;
+    const triggerByIntent  = resp.intent === 'offer_slots';
+    const triggerByContext = offerLikeText.test(outText);
+    if (triggerByIntent || triggerByContext) {
+      const serverSlots = computeAvailableSlots(6).map(s => s.display);
+      slotsInjected = injectSlots(serverSlots);
     }
   }
 
