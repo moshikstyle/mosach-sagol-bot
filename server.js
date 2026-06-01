@@ -1,6 +1,7 @@
 // ============================================================
 // אריה — Sagol Garage WhatsApp Bot (Render + UltraMsg)
 // File: server.js — replace existing in mosach-sagol-bot repo
+// v2.1 — fixed keep-alive, switched to tool use for reliable JSON
 // ============================================================
 
 const express = require('express');
@@ -22,22 +23,20 @@ const C = {
   SUPABASE_KEY:          process.env.SUPABASE_SERVICE_ROLE_KEY || '',
   CLAUDE_MODEL:          process.env.CLAUDE_MODEL          || 'claude-haiku-4-5-20251001',
   MAKE_CALENDAR_WEBHOOK: process.env.MAKE_CALENDAR_WEBHOOK || '',
+  RENDER_URL:            process.env.RENDER_EXTERNAL_URL   || 'https://mosach-sagol-bot.onrender.com',
   PORT:                  process.env.PORT || 3000,
 };
 
 // System prompt: full Aryeh personality from env var
-// (paste content of 01_system_prompt_aryeh.md into SYSTEM_PROMPT_ARYEH)
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT_ARYEH || `אתה אריה, העוזר הדיגיטלי של מוסך סגול. ענה בעברית מקצועית, קצר ומדויק. בלי לתת מחירים — תגיד "חן ישמח לתת הצעת מחיר לאחר בדיקה קצרה". לעולם אל תפנה את הלקוח להתקשר ל-054-3393338 (זה מספר וואטסאפ בלבד). אם רוצה לדבר עם אדם — בקש שם וטלפון, וחן יחזור אליו.`;
 
 // In-memory conversation cache (resets on Render restart — fine for now)
 const conversations = new Map();
 
 // In-memory pending appointment approvals — code → {phone, name, ld}
-// Auto-cleared after 4 hours
 const pendingApprovals = new Map();
 
 // ── Service duration map (minutes) ─────────────────────────
-// Used to compute calendar event end time.
 const SERVICE_DURATIONS = {
   'annual_service':  90,
   'oil_change':      30,
@@ -57,28 +56,23 @@ const SERVICE_DURATIONS = {
 const MAX_PER_DAY = 8;
 const STANDARD_SLOTS = ['09:00', '10:30', '12:00', '13:30', '15:00'];
 const HEBREW_DAY_NAMES = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
-
-// Daily booking counter: 'YYYY-MM-DD' → count
 const dailyBookings = new Map();
 
 function ymd(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-// Generate 5-8 specific available slots for the next ~10 working days
 function computeAvailableSlots(limit = 6) {
   const slots = [];
   const now   = new Date();
   for (let i = 1; i <= 14 && slots.length < limit; i++) {
     const d   = new Date(now.getTime() + i * 24 * 60 * 60 * 1000);
-    const dow = d.getDay(); // 0=Sun, 5=Fri, 6=Sat
-    if (dow === 5 || dow === 6) continue; // garage closed
+    const dow = d.getDay();
+    if (dow === 5 || dow === 6) continue;
     const key   = ymd(d);
     const count = dailyBookings.get(key) || 0;
     if (count >= MAX_PER_DAY) continue;
-
-    // Pick 2 representative slot times for this day (morning + afternoon)
-    const picks = [STANDARD_SLOTS[0], STANDARD_SLOTS[3]]; // 09:00 + 13:30
+    const picks = [STANDARD_SLOTS[0], STANDARD_SLOTS[3]];
     for (const time of picks) {
       if (slots.length >= limit) break;
       slots.push({
@@ -94,9 +88,7 @@ function computeAvailableSlots(limit = 6) {
 
 function formatSlotsForPrompt() {
   const slots = computeAvailableSlots(6);
-  if (slots.length === 0) {
-    return 'כל הסלוטים תפוסים השבוע. תכוון את הלקוח לחזור אלינו בשבוע הבא.';
-  }
+  if (slots.length === 0) return 'כל הסלוטים תפוסים השבוע. תכוון את הלקוח לחזור אלינו בשבוע הבא.';
   return slots.map(s => `• ${s.display}`).join('\n');
 }
 
@@ -107,7 +99,6 @@ function isUrgentRequest(msg) {
 }
 
 function genApprovalCode() {
-  // 4-char alphanumeric, easy to type
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let s = '';
   for (let i = 0; i < 4; i++) s += chars[Math.floor(Math.random() * chars.length)];
@@ -150,69 +141,92 @@ async function send(to, body) {
   }
 }
 
-// ── Send an interactive button message via UltraMsg ─────────
-// Falls back to plain text if buttons endpoint fails.
-async function sendButtons(to, body, buttons, header, footer) {
-  // UltraMsg accepts up to 3 buttons. Buttons are sent as comma-separated string.
-  const buttonsList = (buttons || []).slice(0, 3);
-  if (buttonsList.length === 0) return send(to, body);
-
-  try {
-    const payload = {
-      token:   C.WA_TOKEN,
-      to,
-      body,
-      footer:  footer || '',
-      buttons: buttonsList.join(','),
-    };
-    if (header) payload.header = header;
-
-    const resp = await axios.post(
-      `https://api.ultramsg.com/${C.WA_INSTANCE}/messages/buttons`,
-      payload,
-      { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
-    );
-    if (resp.data?.sent === 'true' || resp.data?.sent === true) {
-      console.log(`🔘 buttons → ${to}: [${buttonsList.join(' | ')}]`);
-      return true;
+// ── Claude tool definition for structured output ────────────
+// Using tool use instead of JSON prefill — far more reliable.
+const ARYEH_TOOL = {
+  name: 'respond_to_customer',
+  description: 'Send a WhatsApp response to the garage customer. Always call this tool.',
+  input_schema: {
+    type: 'object',
+    required: ['message', 'intent'],
+    properties: {
+      message: {
+        type: 'string',
+        description: 'The Hebrew message to send to the customer. Friendly, professional, concise.'
+      },
+      intent: {
+        type: 'string',
+        enum: ['greeting', 'info', 'book_appointment', 'offer_slots', 'escalate', 'urgent', 'other'],
+        description: 'The primary intent of this interaction'
+      },
+      lead_score: {
+        type: 'integer',
+        minimum: 0,
+        maximum: 10,
+        description: 'How likely this is to become a paying customer (0=low, 10=confirmed)'
+      },
+      lead_data: {
+        type: 'object',
+        description: 'Structured data extracted from the conversation',
+        properties: {
+          name:              { type: 'string' },
+          car_make:          { type: 'string' },
+          car_model:         { type: 'string' },
+          car_year:          { type: 'string' },
+          km:                { type: 'string' },
+          service_requested: {
+            type: 'string',
+            enum: ['annual_service','oil_change','test_transfer','brake_check','general_check',
+                   'alignment','ac_service','diagnostic','electrical','transmission','suspension',
+                   'general_service','other']
+          },
+          preferred_date:    { type: 'string' },
+          area:              { type: 'string' },
+          offered_slots:     { type: 'array', items: { type: 'string' } }
+        }
+      },
+      escalate_to: {
+        type: 'string',
+        enum: ['chen', 'moshik'],
+        description: 'Who to escalate to, if needed'
+      },
+      internal_note: {
+        type: 'string',
+        description: 'Internal note for Chen/Moshik about this customer'
+      },
+      buttons: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Optional quick-reply options to show customer (max 3)'
+      }
     }
-    // Unsupported or error → fall back
-    console.warn('Buttons endpoint returned:', resp.data, '— falling back to text');
-    const fallback = `${body}\n\n${buttonsList.map(b => `▸ ${b}`).join('\n')}\n\n(השב עם הטקסט של הכפתור הרצוי)`;
-    await send(to, fallback);
-    return false;
-  } catch (e) {
-    console.error('❌ UltraMsg buttons:', e.response?.data || e.message, '— falling back to text');
-    const fallback = `${body}\n\n${buttonsList.map(b => `▸ ${b}`).join('\n')}\n\n(השב עם הטקסט של הכפתור הרצוי)`;
-    await send(to, fallback);
-    return false;
   }
-}
+};
 
-// ── Call Claude with JSON prefill (forces structured output) ─
+// ── Call Claude with tool use (reliable structured output) ───
 async function callClaude(history, userMessage) {
-  const msgs = [
-    ...history.slice(-19),
-    { role: 'user',      content: userMessage },
-    { role: 'assistant', content: '{' }
-  ];
-
-  // Build enriched system prompt with live availability slots
   const liveSlots = formatSlotsForPrompt();
   const enrichedSystem = SYSTEM_PROMPT
     + '\n\n## סלוטים פנויים כרגע ביומן של המוסך — להציע רק מהרשימה הזאת!\n'
     + liveSlots
-    + '\n\n**אסור** להציע זמן שלא מופיע ברשימה למעלה. אם הלקוח רוצה זמן אחר — הצע לו לבחור מהרשימה הקיימת.';
+    + '\n\n**אסור** להציע זמן שלא מופיע ברשימה למעלה. אם הלקוח רוצה זמן אחר — הצע לו לבחור מהרשימה הקיימת.'
+    + '\n\nחובה תמיד לקרוא לכלי respond_to_customer עם כל התגובות שלך.';
+
+  const msgs = [
+    ...history.slice(-19),
+    { role: 'user', content: userMessage }
+  ];
 
   try {
     const r = await axios.post(
       'https://api.anthropic.com/v1/messages',
       {
-        model:          C.CLAUDE_MODEL,
-        max_tokens:     1024,
-        system:         enrichedSystem,
-        messages:       msgs,
-        stop_sequences: ['\n}\n']
+        model:      C.CLAUDE_MODEL,
+        max_tokens: 2048,
+        system:     enrichedSystem,
+        messages:   msgs,
+        tools:      [ARYEH_TOOL],
+        tool_choice: { type: 'tool', name: 'respond_to_customer' }
       },
       {
         headers: {
@@ -220,24 +234,28 @@ async function callClaude(history, userMessage) {
           'anthropic-version': '2023-06-01',
           'Content-Type':      'application/json',
         },
-        timeout: 20000,
+        timeout: 25000,
       }
     );
 
-    const raw      = r.data.content?.[0]?.text || '';
-    const fullJson = '{' + raw.trim() + '\n}';
-    console.log(`📝 Claude raw length: ${raw.length}`);
-
-    try {
-      const parsed = JSON.parse(fullJson);
-      return parsed;
-    } catch (e) {
-      console.error('❌ JSON parse failed:', e.message, 'raw:', raw.slice(0, 200));
-      // Last resort: return raw text as message
-      return { message: raw.replace(/[{}"]/g, '').trim(), intent: 'other', lead_data: {}, lead_score: 0, escalate_to: null, internal_note: 'JSON parse failed' };
+    // Extract tool use block
+    const toolUse = r.data.content?.find(b => b.type === 'tool_use');
+    if (toolUse?.input) {
+      console.log(`📝 Claude tool call OK — intent: ${toolUse.input.intent}, score: ${toolUse.input.lead_score}`);
+      return toolUse.input;
     }
+
+    // Fallback: check for text block
+    const textBlock = r.data.content?.find(b => b.type === 'text');
+    const fallbackMsg = textBlock?.text?.trim() || '';
+    console.warn('⚠️ Claude returned no tool use block. stop_reason:', r.data.stop_reason, 'text:', fallbackMsg.slice(0, 100));
+    return { message: fallbackMsg || 'תודה על פנייתך. חן יחזור אליך בהקדם.', intent: 'other', lead_data: {}, lead_score: 0 };
+
   } catch (e) {
-    console.error('❌ Claude API:', e.response?.data?.error?.message || e.message);
+    const errMsg = e.response?.data?.error?.message || e.message;
+    console.error('❌ Claude API error:', errMsg);
+    // Log the full error for debugging
+    if (e.response?.data) console.error('Claude response:', JSON.stringify(e.response.data).slice(0, 500));
     return null;
   }
 }
@@ -245,7 +263,6 @@ async function callClaude(history, userMessage) {
 // ── Format Israeli phone ─────────────────────────────────────
 function fmtPhone(p) {
   if (!p) return '';
-  // Strip WhatsApp internal suffix (@c.us / @g.us) and any non-digits
   const clean = String(p).replace(/@c\.us$|@g\.us$/, '').replace(/\D/g, '');
   if (clean.startsWith('972') && clean.length === 12) {
     return '0' + clean.slice(3, 5) + '-' + clean.slice(5, 8) + '-' + clean.slice(8);
@@ -253,7 +270,6 @@ function fmtPhone(p) {
   return clean || p;
 }
 
-// Hebrew display name for internal service codes
 const SERVICE_HEBREW = {
   annual_service:   'טיפול שנתי',
   oil_change:       'החלפת שמן וסינון',
@@ -291,9 +307,6 @@ function buildLeadAlert(phone, ld, resp) {
   ].filter(Boolean).join('\n');
 }
 
-// Builds the full appointment alert with clickable wa.me deeplinks.
-// Tapping a link opens WhatsApp with the approval/rejection text pre-filled —
-// the operator just hits Send.
 function buildAppointmentAlertWithLinks(phone, ld, code) {
   const car         = [ld.car_make, ld.car_model, ld.car_year].filter(Boolean).join(' ');
   const approveLink = `https://wa.me/${C.WA_NUMBER}?text=${encodeURIComponent('אישור ' + code)}`;
@@ -344,43 +357,31 @@ function buildEscalationAlert(phone, resp) {
   ].filter(Boolean).join('\n');
 }
 
-// ── Calendar event placeholder time (tomorrow 09:00 Israel time) ─
-// Make/Google Calendar receives this as the tentative slot.
-// Chen sees the customer's actual requested time in the description
-// and adjusts the event after confirming.
 function computeTentativeSlot(serviceKey) {
   const now      = new Date();
   const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
   const dow      = tomorrow.getDay();
   let daysToAdd  = 0;
-  if (dow === 5) daysToAdd = 2;   // Fri → Sun
-  if (dow === 6) daysToAdd = 1;   // Sat → Sun
+  if (dow === 5) daysToAdd = 2;
+  if (dow === 6) daysToAdd = 1;
   const target   = new Date(tomorrow.getTime() + daysToAdd * 24 * 60 * 60 * 1000);
   const yyyy     = target.getFullYear();
   const mm       = String(target.getMonth() + 1).padStart(2, '0');
   const dd       = String(target.getDate()).padStart(2, '0');
-
-  // Duration from service map
-  const minutes = SERVICE_DURATIONS[serviceKey] || SERVICE_DURATIONS.default;
-  const startHr = 9, startMin = 0;
+  const minutes  = SERVICE_DURATIONS[serviceKey] || SERVICE_DURATIONS.default;
+  const startHr  = 9, startMin = 0;
   const endMinutesTotal = startHr * 60 + startMin + minutes;
-  const endHr  = Math.floor(endMinutesTotal / 60);
-  const endMin = endMinutesTotal % 60;
-
+  const endHr    = Math.floor(endMinutesTotal / 60);
+  const endMin   = endMinutesTotal % 60;
   const start = `${yyyy}-${mm}-${dd}T${String(startHr).padStart(2, '0')}:${String(startMin).padStart(2, '0')}:00+03:00`;
   const end   = `${yyyy}-${mm}-${dd}T${String(endHr).padStart(2, '0')}:${String(endMin).padStart(2, '0')}:00+03:00`;
-
   return { start, end, dateKey: `${yyyy}-${mm}-${dd}` };
 }
 
-// ── Send appointment to Google Calendar via Make webhook ────
 async function pushToCalendar(phone, ld, resp) {
   if (!C.MAKE_CALENDAR_WEBHOOK) return;
-
   const { start, end, dateKey } = computeTentativeSlot(ld.service_requested);
-  // Track daily count
   dailyBookings.set(dateKey, (dailyBookings.get(dateKey) || 0) + 1);
-
   const payload = {
     name:                 ld.name || '',
     phone:                fmtPhone(phone),
@@ -392,19 +393,14 @@ async function pushToCalendar(phone, ld, resp) {
     end_iso:              end,
     internal_note:        resp.internal_note || ''
   };
-
   try {
-    await axios.post(C.MAKE_CALENDAR_WEBHOOK, payload, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000
-    });
+    await axios.post(C.MAKE_CALENDAR_WEBHOOK, payload, { headers: { 'Content-Type': 'application/json' }, timeout: 10000 });
     console.log(`📅 Calendar event sent for ${ld.name}`);
   } catch (e) {
     console.error('❌ Calendar webhook:', e.response?.data || e.message);
   }
 }
 
-// ── Save to Supabase (fire-and-forget, optional) ─────────────
 async function saveToSupabase(table, body) {
   if (!C.SUPABASE_URL || !C.SUPABASE_KEY) return;
   try {
@@ -435,10 +431,6 @@ async function reply(phone, profileName, userMessage) {
   let outText = (resp.message || '').trim();
 
   // ── Slot offering: append clickable wa.me links per slot ────
-  // Three layers of detection, in order of preference:
-  //   1. Aryeh tagged intent="offer_slots" + filled lead_data.offered_slots
-  //   2. Slot patterns visible in the message text (regex)
-  //   3. Aryeh's message implies slot offering — use server-computed slots
   const offeredSlots = resp.lead_data?.offered_slots;
   let slotsInjected  = false;
 
@@ -453,18 +445,15 @@ async function reply(phone, profileName, userMessage) {
     return true;
   };
 
-  // Layer 1: explicit intent + structured slot list
   if (resp.intent === 'offer_slots' && Array.isArray(offeredSlots) && offeredSlots.length) {
     slotsInjected = injectSlots(offeredSlots);
   }
 
-  // Layer 2: regex-detect slot patterns already written in body
   if (!slotsInjected) {
     const slotRegex = /יום\s+(ראשון|שני|שלישי|רביעי|חמישי)\s*\(\d{1,2}\/\d{1,2}\)\s*\d{1,2}:\d{2}/g;
     const matches   = outText.match(slotRegex);
     if (matches && matches.length >= 2) {
       const uniqueSlots = [...new Set(matches)];
-      // Strip the original slot lines to avoid duplication
       let cleaned = outText;
       for (const slot of uniqueSlots) {
         const lineRegex = new RegExp(`[•\\-\\*\\s]*${slot.replace(/[()/]/g, '\\$&')}\\s*\\n?`, 'g');
@@ -476,18 +465,14 @@ async function reply(phone, profileName, userMessage) {
     }
   }
 
-  // Layer 3: message implies slot offering but no list provided → use server's slots
   if (!slotsInjected) {
     const offerLikeText = /(הזמנים\s+(הפנויים|הקרובים|הזמינים))|(בחר\s+.*\s*(זמן|מועד|הגעה))|(הנה\s+.*(זמנים|מועדים|אפשרויות))/i;
-    const triggerByIntent  = resp.intent === 'offer_slots';
-    const triggerByContext = offerLikeText.test(outText);
-    if (triggerByIntent || triggerByContext) {
+    if (resp.intent === 'offer_slots' || offerLikeText.test(outText)) {
       const serverSlots = computeAvailableSlots(6).map(s => s.display);
       slotsInjected = injectSlots(serverSlots);
     }
   }
 
-  // UltraMsg has no interactive buttons → render as text hints
   if (Array.isArray(resp.buttons) && resp.buttons.length > 0) {
     const lines = resp.buttons
       .filter(b => typeof b === 'string' && b.trim())
@@ -514,23 +499,13 @@ async function reply(phone, profileName, userMessage) {
     typeof ld.preferred_date === 'string' && ld.preferred_date.length > 1 &&
     !conv.notified.appointment
   ) {
-    // Server-side safety: block weekend bookings even if Aryeh missed it
     if (isWeekendRequest(ld.preferred_date)) {
       console.log(`🚫 Weekend booking blocked: "${ld.preferred_date}"`);
-      const blockAlert = buildWeekendBlockAlert(phone, ld);
-      await send(C.MOSHIK_PHONE, blockAlert);
-      // Don't mark as notified — let user re-attempt with valid day
+      await send(C.MOSHIK_PHONE, buildWeekendBlockAlert(phone, ld));
     } else {
       const code = genApprovalCode();
-      pendingApprovals.set(code, {
-        phone,
-        name: ld.name,
-        ld,
-        createdAt: Date.now()
-      });
-      // Auto-cleanup after 4 hours
+      pendingApprovals.set(code, { phone, name: ld.name, ld, createdAt: Date.now() });
       setTimeout(() => pendingApprovals.delete(code), 4 * 60 * 60 * 1000);
-
       const alertBody = buildAppointmentAlertWithLinks(phone, ld, code);
       await send(C.CHEN_PHONE,   alertBody);
       await send(C.MOSHIK_PHONE, alertBody);
@@ -547,81 +522,58 @@ async function reply(phone, profileName, userMessage) {
 
   // ── Log to Supabase (best-effort) ──────────────────────
   saveToSupabase('bot_messages', {
-    direction:      'in',
-    body:           userMessage,
-    raw_payload:    { from: phone, profileName }
+    direction: 'in',  body: userMessage,  raw_payload: { from: phone, profileName }
   });
   saveToSupabase('bot_messages', {
-    direction:      'out',
-    body:           outText,
-    intent:         resp.intent,
-    lead_score:     resp.lead_score,
-    internal_note:  resp.internal_note,
-    raw_payload:    resp
+    direction: 'out', body: outText, intent: resp.intent,
+    lead_score: resp.lead_score, internal_note: resp.internal_note, raw_payload: resp
   });
 
   return outText;
 }
 
 // ── Detect operator approval/rejection commands ──────────────
-// Returns true if the message was an operator command (and was handled)
 async function tryOperatorCommand(from, msg) {
   const cleanFrom = from.replace(/\D/g, '');
-  const isOperator = cleanFrom === C.CHEN_PHONE || cleanFrom === C.MOSHIK_PHONE;
+  const isOperator = cleanFrom === C.CHEN_PHONE.replace(/\D/g, '') ||
+                     cleanFrom === C.MOSHIK_PHONE.replace(/\D/g, '');
   if (!isOperator) return false;
 
-  // Normalize: strip emoji/decorative chars + collapse whitespace
   const trimmed = msg.trim().replace(/^[\s✅✓❌✗🔘📋🟢🔴⚪️▸•]+/u, '').trim();
 
-  // "פרטים CODE" — return full lead details to the operator
   const detailsMatch = trimmed.match(/^(פרטים|details|info)[\s:]+([A-Z0-9]{3,6})/i);
   if (detailsMatch) {
     const code    = detailsMatch[2].toUpperCase();
     const pending = pendingApprovals.get(code);
-    if (!pending) {
-      await send(from, `⚠️ קוד ${code} לא נמצא או פג תוקף.`);
-      return true;
-    }
+    if (!pending) { await send(from, `⚠️ קוד ${code} לא נמצא או פג תוקף.`); return true; }
     const car = [pending.ld.car_make, pending.ld.car_model, pending.ld.car_year].filter(Boolean).join(' ');
     const details = [
-      `📋 *פרטי ליד ${code}*`,
-      '',
-      `👤 ${pending.name}`,
-      `📱 ${fmtPhone(pending.phone)}`,
-      car                            && `🚗 ${car}`,
-      pending.ld.km                  && `📊 ${pending.ld.km} ק"מ`,
-      pending.ld.service_requested   && `🔧 ${pending.ld.service_requested}`,
-      pending.ld.preferred_date      && `🗓️ זמן: ${pending.ld.preferred_date}`,
-      pending.ld.area                && `📍 ${pending.ld.area}`,
-      '',
-      `לאישור: השב *אישור ${code}*`,
-      `לדחיה: השב *דחה ${code}*`
+      `📋 *פרטי ליד ${code}*`, '',
+      `👤 ${pending.name}`, `📱 ${fmtPhone(pending.phone)}`,
+      car && `🚗 ${car}`,
+      pending.ld.km && `📊 ${pending.ld.km} ק"מ`,
+      pending.ld.service_requested && `🔧 ${pending.ld.service_requested}`,
+      pending.ld.preferred_date && `🗓️ זמן: ${pending.ld.preferred_date}`,
+      pending.ld.area && `📍 ${pending.ld.area}`,
+      '', `לאישור: השב *אישור ${code}*`, `לדחיה: השב *דחה ${code}*`
     ].filter(Boolean).join('\n');
     await send(from, details);
     return true;
   }
 
-  // Approval pattern: "אישור CODE" / "אשר CODE" / "מאשר CODE" / "approve CODE" / "ok CODE"
   const approveMatch = trimmed.match(/^(אישור|אשר|מאשר|approve|ok)[\s:]+([A-Z0-9]{3,6})/i);
   if (approveMatch) {
     const code    = approveMatch[2].toUpperCase();
     const pending = pendingApprovals.get(code);
-    if (!pending) {
-      await send(from, `⚠️ קוד ${code} לא נמצא או פג תוקף. ייתכן שהתור כבר אושר.`);
-      return true;
-    }
+    if (!pending) { await send(from, `⚠️ קוד ${code} לא נמצא או פג תוקף. ייתכן שהתור כבר אושר.`); return true; }
     const customerMsg = [
-      `שלום ${pending.name} 👋`,
-      '',
+      `שלום ${pending.name} 👋`, '',
       `התור שלך אושר ✅`,
       pending.ld.preferred_date && `📅 ${pending.ld.preferred_date}`,
       pending.ld.service_requested && `🔧 ${pending.ld.service_requested}`,
-      '',
-      '📍 מוסך סגול, רבניצקי 5 פתח תקווה',
-      '',
+      '', '📍 מוסך סגול, רבניצקי 5 פתח תקווה', '',
       'נשמח לראותך! אם משהו משתנה — חן יחזור אליך.'
     ].filter(Boolean).join('\n');
-
     await send(pending.phone, customerMsg);
     await send(from, `✅ אישור נשלח ל-${pending.name} (${fmtPhone(pending.phone)})`);
     pendingApprovals.delete(code);
@@ -629,31 +581,23 @@ async function tryOperatorCommand(from, msg) {
     return true;
   }
 
-  // Rejection pattern: "דחה CODE" / "ביטול CODE" / "reject CODE" / "cancel CODE"
   const rejectMatch = trimmed.match(/^(דחה|דחיה|ביטול|reject|cancel)[\s:]+([A-Z0-9]{3,6})/i);
   if (rejectMatch) {
     const code    = rejectMatch[2].toUpperCase();
     const pending = pendingApprovals.get(code);
-    if (!pending) {
-      await send(from, `⚠️ קוד ${code} לא נמצא או פג תוקף.`);
-      return true;
-    }
+    if (!pending) { await send(from, `⚠️ קוד ${code} לא נמצא או פג תוקף.`); return true; }
     const customerMsg = [
-      `שלום ${pending.name} 👋`,
-      '',
+      `שלום ${pending.name} 👋`, '',
       'לצערנו אין לנו זמינות בזמן שביקשת.',
       'חן יחזור אליך תוך כשעה כדי להציע זמן חלופי.',
-      '',
-      'תודה על ההבנה.'
+      '', 'תודה על ההבנה.'
     ].join('\n');
     await send(pending.phone, customerMsg);
     await send(from, `❌ הודעת דחיה נשלחה ל-${pending.name} (${fmtPhone(pending.phone)})`);
     pendingApprovals.delete(code);
-    console.log(`❌ Rejection ${code} sent to customer by ${cleanFrom}`);
     return true;
   }
 
-  // Help pattern: "עזרה" / "help" / "?" — list pending approvals for this operator
   if (/^(עזרה|help|\?)$/i.test(trimmed)) {
     if (pendingApprovals.size === 0) {
       await send(from, 'אין כרגע תורים ממתינים לאישור.');
@@ -668,13 +612,13 @@ async function tryOperatorCommand(from, msg) {
     return true;
   }
 
-  return false; // Not an operator command — let normal flow handle
+  return false;
 }
 
 // ── WEBHOOK from UltraMsg ────────────────────────────────────
 app.post('/webhook', async (req, res) => {
+  // Respond immediately so UltraMsg doesn't retry
   res.status(200).send('OK');
-  console.log('📨 in:', JSON.stringify(req.body).slice(0, 300));
 
   try {
     const b    = req.body;
@@ -684,48 +628,58 @@ app.post('/webhook', async (req, res) => {
     const name = data?.pushname || b?.pushname || 'לקוח';
     const type = (data?.type    || b?.type     || 'chat').toLowerCase();
 
-    if (!from || !msg) return;
-    if (from.replace(/\D/g, '') === C.WA_NUMBER.replace(/\D/g, '')) return;
-    // Accept text and button-reply types (UltraMsg may use 'buttons_reply' or similar)
-    if (!['chat', 'text', 'buttons_reply', 'interactive', 'list_reply', ''].includes(type)) return;
+    // Log all incoming webhooks for debugging
+    console.log(`📨 webhook | type:${type} from:${from} msg:"${String(msg).slice(0, 80)}"`);
+
+    if (!from || !msg) {
+      console.log('⏩ skip: no from or msg');
+      return;
+    }
+
+    // Skip bot's own messages
+    if (from.replace(/\D/g, '') === C.WA_NUMBER.replace(/\D/g, '')) {
+      console.log('⏩ skip: message from self');
+      return;
+    }
+
+    // Skip non-text message types (but be permissive — include unknown types)
+    const SKIP_TYPES = ['image', 'video', 'audio', 'document', 'sticker', 'location', 'vcard', 'revoked'];
+    if (SKIP_TYPES.includes(type)) {
+      console.log(`⏩ skip: non-text type "${type}"`);
+      return;
+    }
 
     console.log(`📩 [${name}] ${from}: "${msg}"`);
 
-    // Check if this is an operator command (Chen / Moshik approving/rejecting)
     const handled = await tryOperatorCommand(from, msg);
     if (handled) return;
 
-    // ── URGENT detection — bypass normal flow, give Chen's phone directly ──
+    // ── URGENT detection ──────────────────────────────────
     if (isUrgentRequest(msg)) {
-      console.log(`🚨 URGENT request from ${from}: "${msg.slice(0, 80)}"`);
+      console.log(`🚨 URGENT from ${from}`);
       const urgentReply = [
-        'מבין שזה דחוף 🚨',
-        '',
+        'מבין שזה דחוף 🚨', '',
         'התקשר ישירות לחן עכשיו:',
-        '*054-8800474*',
-        '',
+        '*054-8800474*', '',
         'הוא יענה לך אישית. אם לא ענה תוך 5 דקות — תתקשר למושיק: *054-4342000*'
       ].join('\n');
       await send(from, urgentReply);
-
-      // Notify Chen so he expects a call
       const chenAlert = [
-        '🚨 *פניה דחופה — צפויה לך שיחה!*',
-        '',
+        '🚨 *פניה דחופה — צפויה לך שיחה!*', '',
         `📱 לקוח: ${fmtPhone(from)}`,
-        `📝 הודעה: "${msg.slice(0, 200)}"`,
-        '',
+        `📝 הודעה: "${msg.slice(0, 200)}"`, '',
         'אריה הפנה אותו אליך ישירות לטלפון.'
       ].join('\n');
-      await send(C.CHEN_PHONE, chenAlert);
+      await send(C.CHEN_PHONE,   chenAlert);
       await send(C.MOSHIK_PHONE, chenAlert);
       return;
     }
 
     const answer = await reply(from, name, msg);
     if (answer) await send(from, answer);
+
   } catch (e) {
-    console.error('❌ Webhook error:', e.message);
+    console.error('❌ Webhook error:', e.message, e.stack?.slice(0, 300));
   }
 });
 
@@ -733,29 +687,83 @@ app.post('/webhook', async (req, res) => {
 app.get('/', (req, res) => res.json({
   status:        '✅ פעיל',
   bot:           'אריה — מוסך סגול',
+  version:       '2.1',
   prompt_chars:  SYSTEM_PROMPT.length,
-  has_api_keys:  !!C.ANTHROPIC_KEY && !!C.WA_TOKEN,
+  has_anthropic: !!C.ANTHROPIC_KEY,
+  has_wa_token:  !!C.WA_TOKEN,
   time:          new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' })
 }));
 
 app.get('/health', (req, res) => res.send('OK'));
 
-// Keep-alive (prevents Render free-tier sleep)
-setInterval(() => {
-  axios.get(`http://localhost:${C.PORT}/health`).catch(() => {});
-}, 10 * 60 * 1000);
+// ── Debug endpoint (check all integrations) ────────────────
+app.get('/debug', async (req, res) => {
+  const results = {
+    anthropic: false,
+    ultramsg:  false,
+    supabase:  !!C.SUPABASE_URL,
+    env: {
+      has_anthropic_key: !!C.ANTHROPIC_KEY,
+      has_wa_token:      !!C.WA_TOKEN,
+      wa_instance:       C.WA_INSTANCE,
+      wa_number:         C.WA_NUMBER,
+    }
+  };
+
+  // Test Anthropic
+  try {
+    await axios.post('https://api.anthropic.com/v1/messages',
+      { model: C.CLAUDE_MODEL, max_tokens: 10, messages: [{ role: 'user', content: 'ping' }] },
+      { headers: { 'x-api-key': C.ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' }, timeout: 10000 }
+    );
+    results.anthropic = true;
+  } catch (e) {
+    results.anthropic_error = e.response?.data?.error?.message || e.message;
+  }
+
+  // Test UltraMsg (get instance info)
+  try {
+    const r = await axios.get(
+      `https://api.ultramsg.com/${C.WA_INSTANCE}/instance/status?token=${C.WA_TOKEN}`,
+      { timeout: 8000 }
+    );
+    results.ultramsg       = true;
+    results.ultramsg_status = r.data?.status?.accountStatus || r.data;
+  } catch (e) {
+    results.ultramsg_error = e.response?.data || e.message;
+  }
+
+  res.json(results);
+});
+
+// ── CRITICAL FIX: External keep-alive to prevent Render sleep ─
+// localhost ping does NOT prevent Render from sleeping.
+// Pinging the external URL resets Render's inactivity timer.
+setInterval(async () => {
+  try {
+    await axios.get(`${C.RENDER_URL}/health`, { timeout: 10000 });
+    console.log('💓 keep-alive ping OK');
+  } catch (e) {
+    console.warn('💔 keep-alive ping failed:', e.message);
+  }
+}, 10 * 60 * 1000); // every 10 minutes
 
 app.listen(C.PORT, () => {
   console.log('\n🔧 ===================================');
-  console.log('   אריה — מוסך סגול WhatsApp Bot');
+  console.log('   אריה — מוסך סגול WhatsApp Bot v2.1');
   console.log('🔧 ===================================');
   console.log(`✅ Port:           ${C.PORT}`);
   console.log(`📱 Instance:       ${C.WA_INSTANCE}`);
-  console.log(`🔑 Anthropic Key:  ${C.ANTHROPIC_KEY ? '✅' : '❌ MISSING'}`);
-  console.log(`🔑 UltraMsg Token: ${C.WA_TOKEN ? '✅' : '❌ MISSING'}`);
+  console.log(`🔑 Anthropic Key:  ${C.ANTHROPIC_KEY ? '✅' : '❌ MISSING!'}`);
+  console.log(`🔑 UltraMsg Token: ${C.WA_TOKEN ? '✅' : '❌ MISSING!'}`);
   console.log(`📝 System Prompt:  ${SYSTEM_PROMPT.length} chars`);
   console.log(`🤖 Model:          ${C.CLAUDE_MODEL}`);
   console.log(`📊 Supabase:       ${C.SUPABASE_URL ? '✅' : '⚠️  not set'}`);
   console.log(`📅 Calendar Hook:  ${C.MAKE_CALENDAR_WEBHOOK ? '✅' : '⚠️  not set'}`);
+  console.log(`🌐 Render URL:     ${C.RENDER_URL}`);
+  console.log(`💡 Keep-alive:     external ping every 10min`);
   console.log('🔧 ===================================\n');
+
+  if (!C.ANTHROPIC_KEY) console.error('🚨 FATAL: ANTHROPIC_API_KEY is not set!');
+  if (!C.WA_TOKEN)      console.error('🚨 FATAL: WA_TOKEN is not set!');
 });
