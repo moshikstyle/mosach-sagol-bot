@@ -7,5 +7,37 @@ services:
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
+      - key: WA_TOKEN
+        sync: false
+      - key: WA_INSTANCE
+        value: instance167769
+      - key: WA_NUMBER
+        value: "972543393338"
+      - key: CHEN_PHONE
+        value: "972548800474"
+      - key: MOSHIK_PHONE
+        value: "972544342000"
+      - key: CLAUDE_MODEL
+        value: claude-haiku-4-5-20251001
       - key: PORT
-        value: 3000
+        value: "3000"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: MAKE_CALENDAR_WEBHOOK
+        sync: false
+      - key: SYSTEM_PROMPT_ARYEH
+        sync: false
+      - key: RENDER_EXTERNAL_URL
+        sync: false
+      # HeyGen integration
+      - key: HEYGEN_API_KEY
+        sync: false
+      - key: HEYGEN_AVATAR_ID
+        sync: false
+      - key: HEYGEN_VOICE_ID
+        sync: false
+      # Admin API token for direct HTTP control from Claude Code
+      - key: BOT_ADMIN_TOKEN
+        sync: false
