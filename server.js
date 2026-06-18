@@ -1,7 +1,7 @@
 // ============================================================
 // אריה — Sagol Garage WhatsApp Bot (Render + UltraMsg)
 // File: server.js — replace existing in mosach-sagol-bot repo
-// v2.1 — fixed keep-alive, switched to tool use for reliable JSON
+// v2.2 — HeyGen video integration
 // ============================================================
 
 const express = require('express');
@@ -25,7 +25,96 @@ const C = {
   MAKE_CALENDAR_WEBHOOK: process.env.MAKE_CALENDAR_WEBHOOK || '',
   RENDER_URL:            process.env.RENDER_EXTERNAL_URL   || 'https://mosach-sagol-bot.onrender.com',
   PORT:                  process.env.PORT || 3000,
+  // HeyGen integration
+  HEYGEN_API_KEY:        process.env.HEYGEN_API_KEY        || '',
+  HEYGEN_AVATAR_ID:      process.env.HEYGEN_AVATAR_ID      || '',
+  HEYGEN_VOICE_ID:       process.env.HEYGEN_VOICE_ID       || '',
+  // Secret token for direct HTTP control from Claude Code
+  BOT_ADMIN_TOKEN:       process.env.BOT_ADMIN_TOKEN       || '',
 };
+
+// ── HeyGen video generation ─────────────────────────────────
+
+async function heygenCreateVideo({ text, avatarId, voiceId, title }) {
+  if (!C.HEYGEN_API_KEY) throw new Error('HEYGEN_API_KEY not set');
+  const avatar = avatarId || C.HEYGEN_AVATAR_ID;
+  const voice  = voiceId  || C.HEYGEN_VOICE_ID;
+
+  const payload = {
+    video_inputs: [{
+      character: {
+        type:      'avatar',
+        avatar_id: avatar,
+        avatar_style: 'normal'
+      },
+      voice: {
+        type:     'text',
+        input_text: text,
+        voice_id: voice
+      }
+    }],
+    dimension: { width: 1280, height: 720 },
+    ...(title && { title })
+  };
+
+  const r = await axios.post(
+    'https://api.heygen.com/v2/video/generate',
+    payload,
+    {
+      headers: {
+        'X-Api-Key':    C.HEYGEN_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      timeout: 20000
+    }
+  );
+  return r.data?.data?.video_id || r.data?.video_id;
+}
+
+async function heygenGetVideoStatus(videoId) {
+  const r = await axios.get(
+    `https://api.heygen.com/v1/video_status.get?video_id=${videoId}`,
+    {
+      headers: { 'X-Api-Key': C.HEYGEN_API_KEY },
+      timeout: 10000
+    }
+  );
+  return r.data?.data || r.data;
+}
+
+// Poll until video is ready (max ~5 min)
+async function heygenWaitForVideo(videoId, maxAttempts = 40) {
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(r => setTimeout(r, 8000));
+    try {
+      const status = await heygenGetVideoStatus(videoId);
+      console.log(`🎬 HeyGen video ${videoId} — status: ${status.status}`);
+      if (status.status === 'completed') return status.video_url || status.url;
+      if (status.status === 'failed')    throw new Error(status.error || 'video generation failed');
+    } catch (e) {
+      if (e.message.includes('failed')) throw e;
+      console.warn(`⚠️ HeyGen poll attempt ${i + 1}:`, e.message);
+    }
+  }
+  throw new Error('HeyGen video timed out after 5 minutes');
+}
+
+async function heygenListAvatars() {
+  const r = await axios.get('https://api.heygen.com/v2/avatars', {
+    headers: { 'X-Api-Key': C.HEYGEN_API_KEY },
+    timeout: 10000
+  });
+  return r.data?.data?.avatars || [];
+}
+
+async function heygenListVoices(lang = 'he') {
+  const r = await axios.get(`https://api.heygen.com/v2/voices`, {
+    headers: { 'X-Api-Key': C.HEYGEN_API_KEY },
+    timeout: 10000
+  });
+  const voices = r.data?.data?.voices || [];
+  return lang ? voices.filter(v => v.language?.toLowerCase().startsWith(lang)) : voices;
+}
 
 // System prompt: full Aryeh personality from env var
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT_ARYEH || `אתה אריה, העוזר הדיגיטלי של מוסך סגול. ענה בעברית מקצועית, קצר ומדויק. בלי לתת מחירים — תגיד "חן ישמח לתת הצעת מחיר לאחר בדיקה קצרה". לעולם אל תפנה את הלקוח להתקשר ל-054-3393338 (זה מספר וואטסאפ בלבד). אם רוצה לדבר עם אדם — בקש שם וטלפון, וחן יחזור אליו.`;
@@ -598,6 +687,46 @@ async function tryOperatorCommand(from, msg) {
     return true;
   }
 
+  // ── Video command: וידאו [phone_or_code] [text] ──────────
+  // Example: "וידאו 972501234567 שלום דוד, אנחנו שמחים לאשר את תורך"
+  // Example: "וידאו ABCD שלום, אנחנו שמחים לאשר את תורך"
+  const videoMatch = trimmed.match(/^(וידאו|video)[\s:]+([^\s]+)\s+(.+)/is);
+  if (videoMatch) {
+    if (!C.HEYGEN_API_KEY) {
+      await send(from, '⚠️ HeyGen לא מוגדר — הוסף HEYGEN_API_KEY ב-Render.');
+      return true;
+    }
+    let targetPhone = null;
+    const target    = videoMatch[2].trim();
+    const text      = videoMatch[3].trim();
+
+    // Resolve code → phone
+    if (/^[A-Z0-9]{3,6}$/i.test(target) && target.length <= 6) {
+      const pending = pendingApprovals.get(target.toUpperCase());
+      if (pending) targetPhone = pending.phone;
+    }
+    if (!targetPhone) {
+      targetPhone = target.replace(/\D/g, '');
+    }
+
+    await send(from, `🎬 יוצר סרטון HeyGen... זה עלול לקחת כמה דקות.`);
+    try {
+      const videoId  = await heygenCreateVideo({ text, title: 'מוסך סגול' });
+      await send(from, `⏳ הסרטון בעיבוד (ID: ${videoId}). אקבל עדכון כשיהיה מוכן...`);
+      const videoUrl = await heygenWaitForVideo(videoId);
+      if (targetPhone) {
+        await send(targetPhone, `🎬 הודעה ממוסך סגול:\n${videoUrl}`);
+        await send(from, `✅ סרטון נשלח ל-${fmtPhone(targetPhone)}\n${videoUrl}`);
+      } else {
+        await send(from, `✅ הסרטון מוכן:\n${videoUrl}`);
+      }
+    } catch (e) {
+      await send(from, `❌ שגיאה ביצירת סרטון HeyGen: ${e.message}`);
+      console.error('HeyGen error:', e.message);
+    }
+    return true;
+  }
+
   if (/^(עזרה|help|\?)$/i.test(trimmed)) {
     if (pendingApprovals.size === 0) {
       await send(from, 'אין כרגע תורים ממתינים לאישור.');
@@ -606,7 +735,7 @@ async function tryOperatorCommand(from, msg) {
       for (const [code, p] of pendingApprovals) {
         lines.push(`• ${code}: ${p.name} (${fmtPhone(p.phone)}) — ${p.ld.service_requested || ''} ${p.ld.preferred_date || ''}`);
       }
-      lines.push('', 'להאישור: *אישור [קוד]*', 'לדחיה: *דחה [קוד]*');
+      lines.push('', 'להאישור: *אישור [קוד]*', 'לדחיה: *דחה [קוד]*', 'לסרטון: *וידאו [קוד/טלפון] [טקסט]*');
       await send(from, lines.join('\n'));
     }
     return true;
@@ -687,10 +816,12 @@ app.post('/webhook', async (req, res) => {
 app.get('/', (req, res) => res.json({
   status:        '✅ פעיל',
   bot:           'אריה — מוסך סגול',
-  version:       '2.1',
+  version:       '2.2',
   prompt_chars:  SYSTEM_PROMPT.length,
   has_anthropic: !!C.ANTHROPIC_KEY,
   has_wa_token:  !!C.WA_TOKEN,
+  has_heygen:    !!C.HEYGEN_API_KEY,
+  has_admin_api: !!C.BOT_ADMIN_TOKEN,
   time:          new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' })
 }));
 
@@ -736,6 +867,123 @@ app.get('/debug', async (req, res) => {
   res.json(results);
 });
 
+// ── Admin auth middleware ────────────────────────────────────
+function requireAdmin(req, res, next) {
+  if (!C.BOT_ADMIN_TOKEN) {
+    return res.status(503).json({ error: 'BOT_ADMIN_TOKEN not configured' });
+  }
+  const auth = req.headers.authorization || '';
+  const tok  = auth.startsWith('Bearer ') ? auth.slice(7) : req.query.token || '';
+  if (tok !== C.BOT_ADMIN_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+// ── HeyGen direct control endpoints ─────────────────────────
+// POST /heygen/video — create a video and optionally send to WhatsApp
+// Body: { text, to?, avatarId?, voiceId?, title? }
+app.post('/heygen/video', requireAdmin, async (req, res) => {
+  const { text, to, avatarId, voiceId, title } = req.body;
+  if (!text) return res.status(400).json({ error: 'text required' });
+  if (!C.HEYGEN_API_KEY) return res.status(503).json({ error: 'HEYGEN_API_KEY not set' });
+
+  try {
+    const videoId = await heygenCreateVideo({ text, avatarId, voiceId, title });
+    res.json({ ok: true, videoId, status: 'processing', message: 'polling for completion...' });
+
+    // Continue in background: wait then optionally deliver via WhatsApp
+    heygenWaitForVideo(videoId).then(async videoUrl => {
+      console.log(`✅ HeyGen video ready: ${videoUrl}`);
+      if (to) {
+        const phone = String(to).replace(/\D/g, '');
+        await send(phone, `🎬 הודעה ממוסך סגול:\n${videoUrl}`);
+        console.log(`📤 HeyGen video sent to ${phone}`);
+      }
+    }).catch(e => console.error('HeyGen background error:', e.message));
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /heygen/video/sync — create a video and wait for result (blocks until done)
+// Body: { text, to?, avatarId?, voiceId?, title? }
+app.post('/heygen/video/sync', requireAdmin, async (req, res) => {
+  const { text, to, avatarId, voiceId, title } = req.body;
+  if (!text) return res.status(400).json({ error: 'text required' });
+  if (!C.HEYGEN_API_KEY) return res.status(503).json({ error: 'HEYGEN_API_KEY not set' });
+
+  try {
+    const videoId  = await heygenCreateVideo({ text, avatarId, voiceId, title });
+    const videoUrl = await heygenWaitForVideo(videoId);
+    if (to) {
+      const phone = String(to).replace(/\D/g, '');
+      await send(phone, `🎬 הודעה ממוסך סגול:\n${videoUrl}`);
+    }
+    res.json({ ok: true, videoId, videoUrl, sent: !!to });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /heygen/video/:videoId — check video status
+app.get('/heygen/video/:videoId', requireAdmin, async (req, res) => {
+  if (!C.HEYGEN_API_KEY) return res.status(503).json({ error: 'HEYGEN_API_KEY not set' });
+  try {
+    const status = await heygenGetVideoStatus(req.params.videoId);
+    res.json(status);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /heygen/avatars — list available avatars
+app.get('/heygen/avatars', requireAdmin, async (req, res) => {
+  if (!C.HEYGEN_API_KEY) return res.status(503).json({ error: 'HEYGEN_API_KEY not set' });
+  try {
+    const avatars = await heygenListAvatars();
+    res.json({ count: avatars.length, avatars });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /heygen/voices — list Hebrew voices (pass ?lang=en for English)
+app.get('/heygen/voices', requireAdmin, async (req, res) => {
+  if (!C.HEYGEN_API_KEY) return res.status(503).json({ error: 'HEYGEN_API_KEY not set' });
+  try {
+    const voices = await heygenListVoices(req.query.lang || 'he');
+    res.json({ count: voices.length, voices });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /heygen/status — HeyGen integration health check
+app.get('/heygen/status', requireAdmin, async (req, res) => {
+  res.json({
+    configured:  !!C.HEYGEN_API_KEY,
+    avatar_set:  !!C.HEYGEN_AVATAR_ID,
+    voice_set:   !!C.HEYGEN_VOICE_ID,
+    avatar_id:   C.HEYGEN_AVATAR_ID || null,
+    voice_id:    C.HEYGEN_VOICE_ID  || null,
+  });
+});
+
+// POST /send — send a WhatsApp message directly (admin only)
+// Body: { to, message }
+app.post('/send', requireAdmin, async (req, res) => {
+  const { to, message } = req.body;
+  if (!to || !message) return res.status(400).json({ error: 'to and message required' });
+  try {
+    await send(String(to).replace(/\D/g, ''), message);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── CRITICAL FIX: External keep-alive to prevent Render sleep ─
 // localhost ping does NOT prevent Render from sleeping.
 // Pinging the external URL resets Render's inactivity timer.
@@ -750,7 +998,7 @@ setInterval(async () => {
 
 app.listen(C.PORT, () => {
   console.log('\n🔧 ===================================');
-  console.log('   אריה — מוסך סגול WhatsApp Bot v2.1');
+  console.log('   אריה — מוסך סגול WhatsApp Bot v2.2');
   console.log('🔧 ===================================');
   console.log(`✅ Port:           ${C.PORT}`);
   console.log(`📱 Instance:       ${C.WA_INSTANCE}`);
@@ -760,10 +1008,13 @@ app.listen(C.PORT, () => {
   console.log(`🤖 Model:          ${C.CLAUDE_MODEL}`);
   console.log(`📊 Supabase:       ${C.SUPABASE_URL ? '✅' : '⚠️  not set'}`);
   console.log(`📅 Calendar Hook:  ${C.MAKE_CALENDAR_WEBHOOK ? '✅' : '⚠️  not set'}`);
+  console.log(`🎬 HeyGen:         ${C.HEYGEN_API_KEY ? '✅' : '⚠️  not set'}`);
+  console.log(`🔐 Admin Token:    ${C.BOT_ADMIN_TOKEN ? '✅' : '⚠️  not set (HTTP API disabled)'}`);
   console.log(`🌐 Render URL:     ${C.RENDER_URL}`);
   console.log(`💡 Keep-alive:     external ping every 10min`);
   console.log('🔧 ===================================\n');
 
   if (!C.ANTHROPIC_KEY) console.error('🚨 FATAL: ANTHROPIC_API_KEY is not set!');
   if (!C.WA_TOKEN)      console.error('🚨 FATAL: WA_TOKEN is not set!');
+  if (!C.HEYGEN_API_KEY) console.warn('⚠️  HEYGEN_API_KEY not set — video features disabled');
 });
