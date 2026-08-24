@@ -28,7 +28,25 @@ const C = {
 };
 
 // System prompt: full Aryeh personality from env var
-const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT_ARYEH || `אתה אריה, העוזר הדיגיטלי של מוסך סגול. ענה בעברית מקצועית, קצר ומדויק. בלי לתת מחירים — תגיד "חן ישמח לתת הצעת מחיר לאחר בדיקה קצרה". לעולם אל תפנה את הלקוח להתקשר ל-054-3393338 (זה מספר וואטסאפ בלבד). אם רוצה לדבר עם אדם — בקש שם וטלפון, וחן יחזור אליו.`;
+// Built-in Aryeh prompt is authoritative (env SYSTEM_PROMPT_ARYEH intentionally ignored — it contained typos)
+const SYSTEM_PROMPT = `אתה אריה, העוזר הדיגיטלי של מוסך סגול — מוסך מורשה בפתח תקווה (רבניצקי 5) בניהולו של חן בר, מכונאי עם ניסיון של 20+ שנה.
+
+## סגנון
+- עברית תקנית, מקצועית וחמה. קצר ולעניין — 2–4 שורות לכל תשובה.
+- בלי מילים כמו "בוודאי", "כמובן", "נהדר", "מצוין". בלי סימני קריאה מיותרים.
+- אתה נציג בכיר של עסק אמיתי, לא צ'אטבוט.
+
+## מה אתה יודע לעשות
+- לענות על שאלות שירות: טיפול תקופתי, בדיקה לפני טסט, בלמים, מיזוג, חשמל רכב, דיאגנוסטיקה, פנצ'רים, איזון גלגלים.
+- לקבוע תור (רק מתוך הסלוטים הפנויים שתקבל).
+- לאסוף פרטי לקוח: שם מלא, דגם רכב + שנה, טלפון.
+
+## כללים קשיחים
+- מחירים: לעולם אל תתחייב למחיר. אמור "חן ישמח לתת הצעת מחיר מדויקת אחרי בדיקה קצרה".
+- לעולם אל תפנה להתקשר ל-054-3393338 — זה מספר וואטסאפ בלבד.
+- לקוח שמבקש אדם אמיתי: בקש שם וטלפון, וחן יחזור אליו בהקדם.
+- אל תמציא שירותים, זמינות או פרטים שאינך יודע.
+- כתיב תקין בלבד: "תקלה ברכב" (לעולם לא "עותוק").`;
 
 // In-memory conversation cache (resets on Render restart — fine for now)
 const conversations = new Map();
@@ -249,7 +267,7 @@ async function callClaude(history, userMessage) {
     const textBlock = r.data.content?.find(b => b.type === 'text');
     const fallbackMsg = textBlock?.text?.trim() || '';
     console.warn('⚠️ Claude returned no tool use block. stop_reason:', r.data.stop_reason, 'text:', fallbackMsg.slice(0, 100));
-    return { message: fallbackMsg || 'תודה על פנייתך. חן יחזור אליך בהקדם.', intent: 'other', lead_data: {}, lead_score: 0 };
+    return { message: fallbackMsg || 'תודה על פנייתך. חן יחזור אליך בהקדם. אפשר לרשום שם מלא + דגם רכב?', intent: 'other', lead_data: {}, lead_score: 0 };
 
   } catch (e) {
     const errMsg = e.response?.data?.error?.message || e.message;
@@ -418,6 +436,22 @@ async function saveToSupabase(table, body) {
   }
 }
 
+
+// ── Alert Moshik on Claude API failures (throttled 15 min) ──
+let lastApiFailureAlert = 0;
+async function notifyApiFailure(phone, userMessage) {
+  try {
+    const now = Date.now();
+    if (now - lastApiFailureAlert < 15 * 60 * 1000) return;
+    lastApiFailureAlert = now;
+    await sendWhatsApp(C.MOSHIK_PHONE,
+      '🛑 *הבוט של המוסך לא מצליח לקרוא ל-Claude API!*\n\n' +
+      'לקוחות מקבלים תשובת חירום במקום מענה חכם.\n' +
+      'בדוק ב-Render: ANTHROPIC_API_KEY (Environment → mosach-sagol-bot).\n\n' +
+      '📱 לקוח אחרון: ' + phone + '\n💬 _' + String(userMessage).slice(0, 120) + '_');
+  } catch (e) { console.error('notifyApiFailure failed:', e.message); }
+}
+
 // ── Main reply pipeline ─────────────────────────────────────
 async function reply(phone, profileName, userMessage) {
   const conv = getConv(phone);
@@ -425,7 +459,8 @@ async function reply(phone, profileName, userMessage) {
 
   const resp = await callClaude(conv.messages, userMessage);
   if (!resp) {
-    return 'תודה על פנייתך. חן יחזור אליך בהקדם. אפשר להשאיר שם וטלפון?';
+    notifyApiFailure(phone, userMessage); // fire-and-forget
+    return 'שלום, כאן מוסך סגול. יש עומס רגעי במערכת — חן יחזור אליך בהקדם.\nכדי שנזרז את הטיפול, אפשר לרשום כאן שם מלא + דגם רכב?';
   }
 
   let outText = (resp.message || '').trim();
