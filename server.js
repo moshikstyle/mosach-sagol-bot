@@ -39,6 +39,7 @@ const SYSTEM_PROMPT = `אתה אריה, העוזר הדיגיטלי של מוס�
 ## פרטי המוסך (עובדות — אל תסטה מהן)
 - שעות פעילות: ימים א'–ה', 08:00–16:00. בשישי ושבת המוסך סגור.
 - כתובת: רבניצקי 5, פתח תקווה.
+- תורים נקבעים רק בין 08:00 ל-15:00. לעולם אל תציע או תאשר תור שמתחיל אחרי 15:00 — אם הלקוח מבקש שעה מאוחרת, הצע את המועד הפנוי הקרוב עד 15:00.
 
 ## מה אתה יודע לעשות
 - לענות על שאלות שירות: טיפול תקופתי, בדיקה לפני טסט, בלמים, מיזוג, חשמל רכב, דיאגנוסטיקה, פנצ'רים, איזון גלגלים.
@@ -125,6 +126,17 @@ function genApprovalCode() {
   let s = '';
   for (let i = 0; i < 4; i++) s += chars[Math.floor(Math.random() * chars.length)];
   return s;
+}
+
+// Appointments may not start after 15:00 (garage closes 16:00)
+const LAST_START_MINUTES = 15 * 60;
+function isAfterHoursRequest(text) {
+  if (!text || typeof text !== 'string') return false;
+  const times = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/g) || [];
+  return times.some(t => {
+    const [h, m] = t.split(':').map(Number);
+    return h * 60 + m > LAST_START_MINUTES;
+  });
 }
 
 function isWeekendRequest(text) {
@@ -541,6 +553,14 @@ async function reply(phone, profileName, userMessage) {
     if (isWeekendRequest(ld.preferred_date)) {
       console.log(`🚫 Weekend booking blocked: "${ld.preferred_date}"`);
       await send(C.MOSHIK_PHONE, buildWeekendBlockAlert(phone, ld));
+    } else if (isAfterHoursRequest(ld.preferred_date)) {
+      console.log(`🚫 After-15:00 booking blocked: "${ld.preferred_date}"`);
+      await send(C.MOSHIK_PHONE, [
+        '⏰ *אריה חסם תור אחרי 15:00*',
+        `👤 ${ld.name} — ${fmtPhone(phone)}`,
+        `🗓️ זמן שביקש: ${ld.preferred_date}`,
+        'הוואטסאפ של הלקוח פתוח — אפשר לחזור אליו עם מועד עד 15:00.'
+      ].join('\n'));
     } else {
       const code = genApprovalCode();
       pendingApprovals.set(code, { phone, name: ld.name, ld, createdAt: Date.now() });
